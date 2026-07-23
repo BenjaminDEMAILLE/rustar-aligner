@@ -221,6 +221,26 @@ impl std::str::FromStr for TwopassMode {
     }
 }
 
+/// STAR's `--waspOutputMode`: WASP allele-specific-mapping filter output.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum WaspOutputMode {
+    #[default]
+    None,
+    /// Emit the `vW` SAM tag (and `vA`/`vG` when requested in `--outSAMattributes`).
+    SAMtag,
+}
+
+impl std::str::FromStr for WaspOutputMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "None" => Ok(Self::None),
+            "SAMtag" => Ok(Self::SAMtag),
+            _ => Err(format!("unknown waspOutputMode value: '{s}'")),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Parameters struct
 // ---------------------------------------------------------------------------
@@ -616,6 +636,15 @@ pub struct Parameters {
     #[arg(long = "twopass1readsN", default_value_t = -1, allow_hyphen_values = true)]
     pub twopass1_reads_n: i64,
 
+    // ── WASP allele-specific filtering ──────────────────────────────────
+    /// WASP output mode: None or SAMtag (emit the vW tag)
+    #[arg(long = "waspOutputMode", default_value = "None")]
+    pub wasp_output_mode: WaspOutputMode,
+
+    /// VCF of heterozygous SNVs for WASP filtering (required with --waspOutputMode SAMtag)
+    #[arg(long = "varVCFfile")]
+    pub var_vcf_file: Option<PathBuf>,
+
     // ── Chimeric ────────────────────────────────────────────────────────
     // ── Debug ───────────────────────────────────────────────────────
     /// Filter for debug logging: only log detailed alignment info for reads matching this name
@@ -915,6 +944,18 @@ impl Parameters {
                 ErrorKind::MissingRequiredArgument,
                 "--quantMode TranscriptomeSAM requires --sjdbGTFfile at genomeGenerate",
             ));
+        }
+
+        // WASP SAMtag mode requires a VCF of heterozygous SNVs; fold the vW bit
+        // into out_sam_attributes so the writer emits it (vA/vG stay opt-in).
+        if params.wasp_output_mode == WaspOutputMode::SAMtag {
+            if params.var_vcf_file.is_none() {
+                return Err(command.error(
+                    ErrorKind::MissingRequiredArgument,
+                    "--waspOutputMode SAMtag requires --varVCFfile",
+                ));
+            }
+            params.out_sam_attributes |= SamAttributes::VW;
         }
 
         Ok(params)

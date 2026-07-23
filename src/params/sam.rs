@@ -20,6 +20,10 @@ bitflags::bitflags! {
         const JI = 1 << 6;
         const XS = 1 << 7;
         const RG = 1 << 8;
+        // WASP allele-specific-mapping tags (require --waspOutputMode SAMtag).
+        const VW = 1 << 9;
+        const VA = 1 << 10;
+        const VG = 1 << 11;
 
         const STANDARD =
             Self::NH.bits() | Self::HI.bits() | Self::AS.bits()
@@ -49,6 +53,9 @@ impl FromStr for SamAttributes {
             "jI" => Self::JI,
             "XS" => Self::XS,
             "RG" => Self::RG,
+            "vW" => Self::VW,
+            "vA" => Self::VA,
+            "vG" => Self::VG,
             other => return Err(format!("unknown --outSAMattributes token '{other}'")),
         })
     }
@@ -94,7 +101,7 @@ impl clap::Args for SamAttributes {
                 .default_values(["Standard"])
                 .help(
                     "SAM optional tags: Standard, All, None, or any combination of \
-                     NH HI AS NM nM MD jM jI XS RG.",
+                     NH HI AS NM nM MD jM jI XS RG vW vA vG.",
                 ),
         )
     }

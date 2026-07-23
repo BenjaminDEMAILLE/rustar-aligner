@@ -34,6 +34,7 @@ pub mod junction;
 pub mod mapq;
 pub mod quant;
 pub mod stats;
+pub mod wasp;
 
 use log::info;
 use noodles::sam::alignment::record::cigar;
@@ -962,6 +963,34 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
     };
     let mut bysj_meta: Vec<BySJReadMeta> = Vec::new();
 
+    // WASP allele-specific filtering context: load the VCF once, and build the
+    // relaxed re-map parameter set. `None` when --waspOutputMode is not SAMtag.
+    let wasp_ctx: Option<crate::wasp::WaspContext> =
+        if params.wasp_output_mode == params::WaspOutputMode::SAMtag {
+            let vcf = params
+                .var_vcf_file
+                .as_ref()
+                .expect("validated: SAMtag requires --varVCFfile");
+            let ctx = crate::wasp::WaspContext::load(
+                vcf,
+                &index.genome.chr_name,
+                &index.genome.chr_start,
+                params,
+            )
+            .map_err(|source| error::Error::Io {
+                source,
+                path: vcf.clone(),
+            })?;
+            info!(
+                "WASP: loaded {} heterozygous SNVs from {}",
+                ctx.snps.len(),
+                vcf.display()
+            );
+            Some(ctx)
+        } else {
+            None
+        };
+
     info!("Aligning reads...");
     loop {
         // Sequential FASTQ reading (unavoidable bottleneck)
@@ -1099,7 +1128,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                     }
                 } else if transcripts.len() <= max_multimaps {
                     // Mapped (within multimap limit)
-                    let records = SamWriter::build_alignment_records(
+                    let mut records = SamWriter::build_alignment_records(
                         &read.name,
                         &clipped_seq,
                         &clipped_qual,
@@ -1108,6 +1137,18 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                         params,
                         n_for_mapq,
                     )?;
+                    // WASP allele-specific filtering: stamp vW/vA/vG on the records.
+                    if let Some(ctx) = wasp_ctx.as_ref() {
+                        crate::wasp::annotate_records_se(
+                            &mut records,
+                            &transcripts,
+                            &clipped_seq,
+                            &read.name,
+                            &index,
+                            ctx,
+                            params.out_sam_attributes,
+                        )?;
+                    }
                     for record in records {
                         buffer.push(record);
                     }
