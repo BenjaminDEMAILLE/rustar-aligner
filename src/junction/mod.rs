@@ -407,6 +407,7 @@ mod tests {
 
         // Two-chromosome toy genome so chr_start[1] != 0.
         let genome = Genome {
+            transform_blocks: None,
             sequence: vec![0; 4000],
             n_genome: 2000,
             n_genome_real: 2000,
