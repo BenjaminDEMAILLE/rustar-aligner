@@ -296,6 +296,20 @@ pub struct Parameters {
     #[arg(long = "clip3pNbases", default_value_t = 0)]
     pub clip3p_nbases: u32,
 
+    /// Coverage signal output: `None` (default) or `bedGraph`. `wiggle` and a 2nd
+    /// word (`read1_5p`/`read2`) are rejected (see `Parameters::validate`)
+    #[arg(long = "outWigType", num_args = 1.., default_values_t = vec![String::from("None")])]
+    pub out_wig_type: Vec<String>,
+
+    /// Coverage-signal normalization: `RPM` (default) or `None` (raw counts)
+    #[arg(long = "outWigNorm", default_value = "RPM")]
+    pub out_wig_norm: String,
+
+    /// Coverage-signal strandedness: `Stranded` (default). `Unstranded` is
+    /// rejected (see `Parameters::validate`)
+    #[arg(long = "outWigStrand", default_value = "Stranded")]
+    pub out_wig_strand: String,
+
     // ── Output ──────────────────────────────────────────────────────────
     /// Output file name prefix (including path)
     #[arg(long = "outFileNamePrefix", default_value = "./")]
@@ -917,6 +931,41 @@ impl Parameters {
             ));
         }
 
+        // --outWigType at alignReads: only `bedGraph` (stranded, full-length) is
+        // implemented. `wiggle`, `--outWigStrand Unstranded`, and the 2nd word
+        // (`read1_5p`/`read2`) are STAR features of `--runMode
+        // inputAlignmentsFromBAM`, which rustar-aligner doesn't have; reject them
+        // loudly rather than silently emitting bedGraph / stranded / full-length
+        // tracks instead.
+        if params
+            .out_wig_type
+            .iter()
+            .any(|t| !t.eq_ignore_ascii_case("None"))
+        {
+            if params
+                .out_wig_type
+                .iter()
+                .any(|t| t.eq_ignore_ascii_case("wiggle"))
+            {
+                return Err(command.error(
+                    ErrorKind::InvalidValue,
+                    "--outWigType wiggle is not implemented; use --outWigType bedGraph",
+                ));
+            }
+            if params.out_wig_strand.eq_ignore_ascii_case("Unstranded") {
+                return Err(command.error(
+                    ErrorKind::InvalidValue,
+                    "--outWigStrand Unstranded is not implemented; use --outWigStrand Stranded",
+                ));
+            }
+            if params.out_wig_type.len() > 1 {
+                return Err(command.error(
+                    ErrorKind::InvalidValue,
+                    "the --outWigType 2nd word (read1_5p / read2) is not implemented; omit it",
+                ));
+            }
+        }
+
         Ok(params)
     }
 
@@ -928,6 +977,18 @@ impl Parameters {
     /// Returns true if `--quantMode TranscriptomeSAM` was requested.
     pub fn quant_transcriptome_sam(&self) -> bool {
         self.quant_mode.iter().any(|m| m == "TranscriptomeSAM")
+    }
+
+    /// Returns true if `--outWigType bedGraph` was requested.
+    pub fn out_wig_bedgraph(&self) -> bool {
+        self.out_wig_type
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case("bedGraph"))
+    }
+
+    /// Returns true unless `--outWigNorm None` was requested (RPM is the default).
+    pub fn out_wig_rpm(&self) -> bool {
+        !self.out_wig_norm.eq_ignore_ascii_case("None")
     }
 }
 

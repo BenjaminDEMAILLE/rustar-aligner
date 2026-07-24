@@ -77,6 +77,8 @@ src/
     segment.rs     -- ChimericSegment and ChimericAlignment data structures
     score.rs       -- Junction type classification, repeat length calculation
     output.rs      -- Chimeric.out.junction writer (14-column format)
+  signal/
+    mod.rs         -- Coverage signal / Signal.*.out.bg bedGraph tracks (--outWigType bedGraph, stranded)
 ```
 
 ## Development Philosophy — Match STAR Exactly

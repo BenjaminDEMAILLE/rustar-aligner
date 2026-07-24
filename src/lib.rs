@@ -33,6 +33,7 @@ pub mod io;
 pub mod junction;
 pub mod mapq;
 pub mod quant;
+pub mod signal;
 pub mod stats;
 
 use log::info;
@@ -661,6 +662,12 @@ struct AlignmentBatchResults {
     unmapped_mate1: Vec<(String, Vec<u8>, Vec<u8>)>,
     /// Unmapped mate2 reads (PE only). Empty unless outReadsUnmapped=Fastx.
     unmapped_mate2: Vec<(String, Vec<u8>, Vec<u8>)>,
+    /// `--outWigType bedGraph` signal contributions: (transcript, is_second_mate)
+    /// per reported alignment. Empty unless enabled and the read/pair mapped
+    /// within the multimap limit. `signal_n_tr` is the shared NH for all of them
+    /// (transcripts.len() for SE, both_mapped.len() for PE).
+    signal_contrib: Vec<(crate::align::transcript::Transcript, bool)>,
+    signal_n_tr: usize,
 }
 
 /// Build transcriptome-space records for a single-end read.  Projects every
@@ -884,6 +891,47 @@ fn extract_junction_keys(
     keys
 }
 
+/// Write the four `--outWigType bedGraph` stranded tracks (STAR's `Signal.{Unique,
+/// UniqueMultiple}.str{1,2}.out.bg`). No-op if `signal` is `None` (feature disabled).
+/// RPM scales the `Unique` tracks by `1e6/nUniq` and `UniqueMultiple` by
+/// `1e6/(nUniq+nMult)` (STAR `signalFromBAM` `normFactor[0]` vs `[1]`); one norm
+/// for both would double `UniqueMultiple` when multimappers exist.
+fn write_signal_tracks(
+    signal: Option<&crate::signal::Signal>,
+    sig_n_uniq: u64,
+    sig_n_mult: u64,
+    params: &Parameters,
+) -> anyhow::Result<()> {
+    let Some(sig) = signal else {
+        return Ok(());
+    };
+    let norm_unique = if sig_n_uniq > 0 {
+        1.0e6 / sig_n_uniq as f64
+    } else {
+        0.0
+    };
+    let norm_mult = if sig_n_uniq + sig_n_mult > 0 {
+        1.0e6 / (sig_n_uniq + sig_n_mult) as f64
+    } else {
+        0.0
+    };
+    for (unique, strand, file) in [
+        (true, 0, "Signal.Unique.str1.out.bg"),
+        (false, 0, "Signal.UniqueMultiple.str1.out.bg"),
+        (true, 1, "Signal.Unique.str2.out.bg"),
+        (false, 1, "Signal.UniqueMultiple.str2.out.bg"),
+    ] {
+        let body = if params.out_wig_rpm() {
+            let norm = if unique { norm_unique } else { norm_mult };
+            sig.bedgraph_rpm(unique, strand, norm)
+        } else {
+            sig.bedgraph(unique, strand)
+        };
+        std::fs::write(params.output_path(file), body)?;
+    }
+    Ok(())
+}
+
 /// Align single-end reads
 #[allow(clippy::too_many_arguments)]
 fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
@@ -940,6 +988,17 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
     let output_unmapped = params.out_sam_unmapped != params::OutSamUnmapped::None;
     let write_unmapped_fastq = params.out_reads_unmapped == params::OutReadsUnmapped::Fastx;
     let by_sjout = params.out_filter_type == OutFilterType::BySJout;
+
+    // --outWigType bedGraph: accumulate the stranded coverage signal over every
+    // reported alignment. Folded sequentially (not thread-safe across the
+    // parallel per-read closures), matching how sam/transcriptome records are
+    // already merged in chunk order below.
+    let out_wig_bedgraph = params.out_wig_bedgraph();
+    let mut signal = out_wig_bedgraph
+        .then(|| crate::signal::Signal::new(&index.genome.chr_name, &index.genome.chr_length));
+    // RPM normalization counters (STAR signalFromBAM `nUniq`/`nMult`): a mapped
+    // read contributes to `nUniq` when uniquely mapped (NH==1), else 1 to `nMult`.
+    let (mut sig_n_uniq, mut sig_n_mult) = (0u64, 0u64);
 
     // BySJout disk buffer: SAM records written to a temp file; only compact metadata kept in RAM.
     // For 100M reads this avoids ~60 GB of Vec<RecordBuf> in memory.
@@ -1031,6 +1090,8 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                         transcriptome_records: Vec::new(),
                         unmapped_mate1: unmapped_m1,
                         unmapped_mate2: Vec::new(),
+                        signal_contrib: Vec::new(),
+                        signal_n_tr: 0,
                     });
                 }
 
@@ -1084,6 +1145,11 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                     };
 
                 // Build SAM records (no I/O, just construction)
+                // --outWigType bedGraph: gathered below only when mapped within the
+                // multimap limit (the same set that gets written to SAM/BAM).
+                let mut signal_contrib = Vec::new();
+                let signal_n_tr = transcripts.len();
+
                 let is_unmapped_se = transcripts.is_empty();
                 if is_unmapped_se {
                     // Unmapped
@@ -1110,6 +1176,9 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                     )?;
                     for record in records {
                         buffer.push(record);
+                    }
+                    if out_wig_bedgraph {
+                        signal_contrib = transcripts.iter().cloned().map(|t| (t, false)).collect();
                     }
                 }
                 // else: too many loci, skip output
@@ -1144,6 +1213,8 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                     transcriptome_records,
                     unmapped_mate1: unmapped_m1,
                     unmapped_mate2: Vec::new(),
+                    signal_contrib,
+                    signal_n_tr,
                 })
             })
             .collect();
@@ -1151,6 +1222,19 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
         if by_sjout {
             for result in batch_results {
                 let batch = result?;
+                // --outWigType bedGraph: fold this read's contribution into the signal.
+                if let Some(sig) = signal.as_mut()
+                    && !batch.signal_contrib.is_empty()
+                {
+                    if batch.signal_n_tr == 1 {
+                        sig_n_uniq += 1;
+                    } else {
+                        sig_n_mult += 1;
+                    }
+                    for (tr, second_mate) in &batch.signal_contrib {
+                        sig.add_transcript(&index.genome, tr, batch.signal_n_tr, *second_mate);
+                    }
+                }
                 // Write SAM records to temp file (disk, not RAM)
                 let n_sam_records = batch.sam_records.records.len() as u32;
                 if let (Some(tw), Some(hdr)) = (&mut bysj_temp_writer, &bysj_sam_header) {
@@ -1174,6 +1258,20 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
             // Normal mode: sequential writing (merge buffers in chunk order)
             for result in batch_results {
                 let batch = result?;
+
+                // --outWigType bedGraph: fold this read's contribution into the signal.
+                if let Some(sig) = signal.as_mut()
+                    && !batch.signal_contrib.is_empty()
+                {
+                    if batch.signal_n_tr == 1 {
+                        sig_n_uniq += 1;
+                    } else {
+                        sig_n_mult += 1;
+                    }
+                    for (tr, second_mate) in &batch.signal_contrib {
+                        sig.add_transcript(&index.genome, tr, batch.signal_n_tr, *second_mate);
+                    }
+                }
 
                 // Write SAM/BAM records
                 writer.write_batch(&batch.sam_records.records)?;
@@ -1304,6 +1402,8 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
         uw.flush()?;
     }
 
+    write_signal_tracks(signal.as_ref(), sig_n_uniq, sig_n_mult, params)?;
+
     Ok(())
 }
 
@@ -1371,6 +1471,13 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
     let output_unmapped = params.out_sam_unmapped != params::OutSamUnmapped::None;
     let write_unmapped_fastq = params.out_reads_unmapped == params::OutReadsUnmapped::Fastx;
     let by_sjout = params.out_filter_type == OutFilterType::BySJout;
+
+    // --outWigType bedGraph: accumulate the stranded coverage signal over every
+    // reported alignment (both mates), folded sequentially per pair.
+    let out_wig_bedgraph = params.out_wig_bedgraph();
+    let mut signal = out_wig_bedgraph
+        .then(|| crate::signal::Signal::new(&index.genome.chr_name, &index.genome.chr_length));
+    let (mut sig_n_uniq, mut sig_n_mult) = (0u64, 0u64);
 
     // BySJout disk buffer: SAM records to temp file, compact metadata in RAM.
     let bysj_temp = if by_sjout {
@@ -1485,6 +1592,8 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                         transcriptome_records: Vec::new(),
                         unmapped_mate1: um1,
                         unmapped_mate2: um2,
+                        signal_contrib: Vec::new(),
+                        signal_n_tr: 0,
                     });
                 }
 
@@ -1506,6 +1615,11 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                         }
                     })
                     .collect();
+
+                // --outWigType bedGraph: gathered below only for both-mapped pairs
+                // within the multimap limit (the same set written to SAM/BAM).
+                let mut signal_contrib = Vec::new();
+                let signal_n_tr = both_mapped.len();
 
                 if results.is_empty() {
                     stats.record_alignment(n_for_mapq, max_multimaps);
@@ -1668,6 +1782,17 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                     for record in records {
                         buffer.push(record);
                     }
+                    if out_wig_bedgraph {
+                        signal_contrib = paired_alns
+                            .iter()
+                            .flat_map(|pa| {
+                                [
+                                    (pa.mate1_transcript.clone(), false),
+                                    (pa.mate2_transcript.clone(), true),
+                                ]
+                            })
+                            .collect();
+                    }
                 }
                 // else: too many loci, skip output
 
@@ -1722,6 +1847,8 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                     transcriptome_records,
                     unmapped_mate1,
                     unmapped_mate2,
+                    signal_contrib,
+                    signal_n_tr,
                 })
             })
             .collect();
@@ -1729,6 +1856,19 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
         if by_sjout {
             for result in batch_results {
                 let batch = result?;
+                // --outWigType bedGraph: fold this pair's contribution into the signal.
+                if let Some(sig) = signal.as_mut()
+                    && !batch.signal_contrib.is_empty()
+                {
+                    if batch.signal_n_tr == 1 {
+                        sig_n_uniq += 1;
+                    } else {
+                        sig_n_mult += 1;
+                    }
+                    for (tr, second_mate) in &batch.signal_contrib {
+                        sig.add_transcript(&index.genome, tr, batch.signal_n_tr, *second_mate);
+                    }
+                }
                 let n_sam_records = batch.sam_records.records.len() as u32;
                 if let (Some(tw), Some(hdr)) = (&mut bysj_temp_writer, &bysj_sam_header) {
                     crate::io::sam::bysj_write_records(tw, hdr, &batch.sam_records.records)?;
@@ -1755,6 +1895,19 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
             // Normal mode: sequential SAM writing
             for result in batch_results {
                 let batch = result?;
+                // --outWigType bedGraph: fold this pair's contribution into the signal.
+                if let Some(sig) = signal.as_mut()
+                    && !batch.signal_contrib.is_empty()
+                {
+                    if batch.signal_n_tr == 1 {
+                        sig_n_uniq += 1;
+                    } else {
+                        sig_n_mult += 1;
+                    }
+                    for (tr, second_mate) in &batch.signal_contrib {
+                        sig.add_transcript(&index.genome, tr, batch.signal_n_tr, *second_mate);
+                    }
+                }
                 writer.write_batch(&batch.sam_records.records)?;
                 if let Some(ref mut tw) = tr_writer {
                     tw.write_batch(&batch.transcriptome_records)?;
@@ -1864,6 +2017,8 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
     if let Some(ref mut uw2) = unmapped_writer2 {
         uw2.flush()?;
     }
+
+    write_signal_tracks(signal.as_ref(), sig_n_uniq, sig_n_mult, params)?;
 
     Ok(())
 }
