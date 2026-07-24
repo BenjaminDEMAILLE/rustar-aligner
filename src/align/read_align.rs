@@ -10,7 +10,6 @@ use crate::error::Error;
 use crate::index::GenomeIndex;
 use crate::params::{IntronMotifFilter, IntronStrandFilter, MultimapperOrder, Parameters};
 use crate::stats::UnmappedReason;
-use rand::{SeedableRng, rngs::StdRng, seq::SliceRandom};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 /// Derive a deterministic per-read RNG seed from `run_rng_seed` + the read name.
@@ -24,6 +23,35 @@ pub(crate) fn per_read_seed(run_rng_seed: u64, read_name: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     read_name.hash(&mut hasher);
     run_rng_seed.wrapping_mul(hasher.finish().wrapping_add(1))
+}
+
+/// A deterministic `splitmix64` step, ported from STAR-rs (which uses it for its own
+/// thread-invariant `--outMultimapperOrder Random` per-read shuffle; see
+/// `docs-old/dev/porting-from-star-rs.md`'s RNG decision). Replaces a general-purpose
+/// PRNG crate with a small in-tree generator, matching the project's dependency-hygiene
+/// preference for self-contained determinism-critical code.
+pub(crate) fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// A deterministic Fisher-Yates shuffle of `order` seeded by `seed`, using `splitmix64`.
+fn shuffle_deterministic<T>(order: &mut [T], seed: u64) {
+    let mut s = seed ^ 0xA076_1D64_78BD_642F;
+    for k in (1..order.len()).rev() {
+        let j = (splitmix64(&mut s) % (k as u64 + 1)) as usize;
+        order.swap(k, j);
+    }
+}
+
+/// A single deterministic draw from `0..n`, using the same `splitmix64` mixing as
+/// `shuffle_deterministic`.
+pub(crate) fn deterministic_index(seed: u64, n: usize) -> usize {
+    let mut s = seed ^ 0xA076_1D64_78BD_642F;
+    (splitmix64(&mut s) % n as u64) as usize
 }
 
 /// Shuffle the prefix of `items` whose `score_fn` equals the first element's score.
@@ -40,7 +68,7 @@ fn shuffle_tied_prefix<T>(items: &mut [T], score_fn: impl Fn(&T) -> i32, seed: u
     if tied < 2 {
         return;
     }
-    items[..tied].shuffle(&mut StdRng::seed_from_u64(seed));
+    shuffle_deterministic(&mut items[..tied], seed);
 }
 
 /// Result of aligning a single read: (transcripts, chimeric_alignments, n_for_mapq, unmapped_reason)

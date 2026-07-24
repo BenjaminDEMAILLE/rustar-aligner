@@ -623,12 +623,11 @@ fn pick_primary_and_mapq(
     read_name: &str,
     params: &Parameters,
 ) -> (usize, u8) {
-    use crate::align::read_align::per_read_seed;
+    use crate::align::read_align::{deterministic_index, per_read_seed};
     use crate::mapq::calculate_mapq;
-    use rand::{RngExt, SeedableRng, rngs::StdRng};
 
-    let mut rng = StdRng::seed_from_u64(per_read_seed(params.run_rng_seed, read_name));
-    let primary_hit = rng.random_range(0..n_alignments);
+    let primary_hit =
+        deterministic_index(per_read_seed(params.run_rng_seed, read_name), n_alignments);
     let mapq = calculate_mapq(n_alignments.max(n_for_mapq), params.out_sam_mapq_unique);
     (primary_hit, mapq)
 }
