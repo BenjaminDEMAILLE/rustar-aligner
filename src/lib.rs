@@ -982,7 +982,8 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
         // Parallel alignment processing
         let batch_results: Vec<Result<AlignmentBatchResults, error::Error>> = batch_to_process
             .par_iter()
-            .map(|read| {
+            .enumerate()
+            .map(|(read_idx, read)| {
                 #[allow(clippy::needless_borrow)]
                 let index = Arc::clone(&index);
                 #[allow(clippy::needless_borrow)]
@@ -990,6 +991,16 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                 #[allow(clippy::needless_borrow)]
                 let sj_stats = Arc::clone(&sj_stats);
                 let quant = quant.as_ref().map(Arc::clone);
+
+                // --outSAMreadID Number: replace QNAME with the read's 1-based input index
+                // (deterministic regardless of thread count: derived from the sequential
+                // FASTQ read order, not from parallel execution order).
+                let out_read_name = if params.out_sam_read_id == crate::params::OutSamReadId::Number
+                {
+                    (read_count + read_idx as u64 + 1).to_string()
+                } else {
+                    read.name.clone()
+                };
 
                 // Apply clipping
                 let (clipped_seq, clipped_qual) =
@@ -1011,7 +1022,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                     }
                     if output_unmapped {
                         let record = SamWriter::build_unmapped_record(
-                            &read.name,
+                            &out_read_name,
                             &clipped_seq,
                             &clipped_qual,
                             params,
@@ -1020,7 +1031,11 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                         buffer.push(record);
                     }
                     let unmapped_m1 = if write_unmapped_fastq {
-                        vec![(read.name.clone(), clipped_seq.clone(), clipped_qual.clone())]
+                        vec![(
+                            out_read_name.clone(),
+                            clipped_seq.clone(),
+                            clipped_qual.clone(),
+                        )]
                     } else {
                         Vec::new()
                     };
@@ -1089,7 +1104,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                     // Unmapped
                     if output_unmapped {
                         let record = SamWriter::build_unmapped_record(
-                            &read.name,
+                            &out_read_name,
                             &clipped_seq,
                             &clipped_qual,
                             params,
@@ -1100,7 +1115,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                 } else if transcripts.len() <= max_multimaps {
                     // Mapped (within multimap limit)
                     let records = SamWriter::build_alignment_records(
-                        &read.name,
+                        &out_read_name,
                         &clipped_seq,
                         &clipped_qual,
                         &transcripts,
@@ -1119,7 +1134,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                     if let Some(ref tidx) = tr_local {
                         build_transcriptome_records_se(
                             &transcripts,
-                            &read.name,
+                            &out_read_name,
                             &clipped_seq,
                             &clipped_qual,
                             &index.genome,
@@ -1132,7 +1147,11 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                     };
 
                 let unmapped_m1 = if write_unmapped_fastq && is_unmapped_se {
-                    vec![(read.name.clone(), clipped_seq.clone(), clipped_qual.clone())]
+                    vec![(
+                        out_read_name.clone(),
+                        clipped_seq.clone(),
+                        clipped_qual.clone(),
+                    )]
                 } else {
                     Vec::new()
                 };
@@ -1412,7 +1431,8 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
         // Parallel alignment processing
         let batch_results: Vec<Result<AlignmentBatchResults, error::Error>> = batch_to_process
             .par_iter()
-            .map(|paired_read| {
+            .enumerate()
+            .map(|(pair_idx, paired_read)| {
                 #[allow(clippy::needless_borrow)]
                 let index = Arc::clone(&index);
                 #[allow(clippy::needless_borrow)]
@@ -1420,6 +1440,25 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                 #[allow(clippy::needless_borrow)]
                 let sj_stats = Arc::clone(&sj_stats);
                 let quant = quant.as_ref().map(Arc::clone);
+
+                // --outSAMreadID Number: replace QNAME with the pair's 1-based input index.
+                let out_read_id_number =
+                    params.out_sam_read_id == crate::params::OutSamReadId::Number;
+                let out_read_name = if out_read_id_number {
+                    (read_count + pair_idx as u64 + 1).to_string()
+                } else {
+                    paired_read.name.clone()
+                };
+                // Unmapped-FASTX mate names: per-mate (with /1,/2 suffix) in Standard mode, the
+                // shared numeric pair index in Number mode.
+                let (fastx_name1, fastx_name2) = if out_read_id_number {
+                    (out_read_name.clone(), out_read_name.clone())
+                } else {
+                    (
+                        paired_read.mate1.name.clone(),
+                        paired_read.mate2.name.clone(),
+                    )
+                };
 
                 // Apply clipping to both mates
                 let (m1_seq, m1_qual) = clip_read(
@@ -1450,7 +1489,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                     }
                     if output_unmapped {
                         let records = SamWriter::build_paired_unmapped_records(
-                            &paired_read.name,
+                            &out_read_name,
                             &m1_seq,
                             &m1_qual,
                             &m2_seq,
@@ -1464,16 +1503,8 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                     }
                     let (um1, um2) = if write_unmapped_fastq {
                         (
-                            vec![(
-                                paired_read.mate1.name.clone(),
-                                m1_seq.clone(),
-                                m1_qual.clone(),
-                            )],
-                            vec![(
-                                paired_read.mate2.name.clone(),
-                                m2_seq.clone(),
-                                m2_qual.clone(),
-                            )],
+                            vec![(fastx_name1.clone(), m1_seq.clone(), m1_qual.clone())],
+                            vec![(fastx_name2.clone(), m2_seq.clone(), m2_qual.clone())],
                         )
                     } else {
                         (Vec::new(), Vec::new())
@@ -1612,7 +1643,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                     // Unmapped pair
                     if output_unmapped {
                         let records = SamWriter::build_paired_unmapped_records(
-                            &paired_read.name,
+                            &out_read_name,
                             &m1_seq,
                             &m1_qual,
                             &m2_seq,
@@ -1632,7 +1663,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                     }) = results.first()
                     {
                         let records = SamWriter::build_half_mapped_records(
-                            &paired_read.name,
+                            &out_read_name,
                             &m1_seq,
                             &m1_qual,
                             &m2_seq,
@@ -1655,7 +1686,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                         .map(|pa| PairedAlignment::clone(pa))
                         .collect();
                     let records = SamWriter::build_paired_records(
-                        &paired_read.name,
+                        &out_read_name,
                         &m1_seq,
                         &m1_qual,
                         &m2_seq,
@@ -1676,7 +1707,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                     if let Some(ref tidx) = tr_local {
                         build_transcriptome_records_pe(
                             both_mapped.iter().map(AsRef::as_ref),
-                            &paired_read.name,
+                            &out_read_name,
                             &m1_seq,
                             &m1_qual,
                             &m2_seq,
@@ -1697,16 +1728,8 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                     let pair_unmapped = results.is_empty() || has_half_mapped;
                     if pair_unmapped {
                         (
-                            vec![(
-                                paired_read.mate1.name.clone(),
-                                m1_seq.clone(),
-                                m1_qual.clone(),
-                            )],
-                            vec![(
-                                paired_read.mate2.name.clone(),
-                                m2_seq.clone(),
-                                m2_qual.clone(),
-                            )],
+                            vec![(fastx_name1.clone(), m1_seq.clone(), m1_qual.clone())],
+                            vec![(fastx_name2.clone(), m2_seq.clone(), m2_qual.clone())],
                         )
                     } else {
                         (Vec::new(), Vec::new())
