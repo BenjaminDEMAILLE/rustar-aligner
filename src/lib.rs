@@ -26,6 +26,7 @@ pub mod params;
 
 pub mod align;
 pub mod chimeric;
+pub mod clip;
 pub mod cpu;
 pub mod genome;
 pub mod index;
@@ -934,8 +935,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
     };
 
     let batch_size = 10000;
-    let clip5p = params.clip5p_nbases as usize;
-    let clip3p = params.clip3p_nbases as usize;
+    let clip_params = crate::clip::clip_params_from(params);
     let max_multimaps = params.out_filter_multimap_nmax as usize;
     let output_unmapped = params.out_sam_unmapped != params::OutSamUnmapped::None;
     let write_unmapped_fastq = params.out_reads_unmapped == params::OutReadsUnmapped::Fastx;
@@ -992,6 +992,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                 let quant = quant.as_ref().map(Arc::clone);
 
                 // Apply clipping
+                let (clip5p, clip3p) = crate::clip::clip_mate(&read.sequence, &clip_params);
                 let (clipped_seq, clipped_qual) =
                     clip_read(&read.sequence, &read.quality, clip5p, clip3p);
 
@@ -1365,8 +1366,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
     };
 
     let batch_size = 10000;
-    let clip5p = params.clip5p_nbases as usize;
-    let clip3p = params.clip3p_nbases as usize;
+    let clip_params = crate::clip::clip_params_from(params);
     let max_multimaps = params.out_filter_multimap_nmax as usize;
     let output_unmapped = params.out_sam_unmapped != params::OutSamUnmapped::None;
     let write_unmapped_fastq = params.out_reads_unmapped == params::OutReadsUnmapped::Fastx;
@@ -1421,18 +1421,23 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                 let sj_stats = Arc::clone(&sj_stats);
                 let quant = quant.as_ref().map(Arc::clone);
 
-                // Apply clipping to both mates
+                // Apply clipping to both mates (each mate's adapter position is
+                // scanned independently, so clip_mate runs once per mate).
+                let (m1_clip5p, m1_clip3p) =
+                    crate::clip::clip_mate(&paired_read.mate1.sequence, &clip_params);
+                let (m2_clip5p, m2_clip3p) =
+                    crate::clip::clip_mate(&paired_read.mate2.sequence, &clip_params);
                 let (m1_seq, m1_qual) = clip_read(
                     &paired_read.mate1.sequence,
                     &paired_read.mate1.quality,
-                    clip5p,
-                    clip3p,
+                    m1_clip5p,
+                    m1_clip3p,
                 );
                 let (m2_seq, m2_qual) = clip_read(
                     &paired_read.mate2.sequence,
                     &paired_read.mate2.quality,
-                    clip5p,
-                    clip3p,
+                    m2_clip5p,
+                    m2_clip3p,
                 );
 
                 let mut buffer = BufferedSamRecords::new();
