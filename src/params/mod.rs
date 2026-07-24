@@ -704,6 +704,11 @@ pub struct Parameters {
     #[arg(long = "chimOutType", num_args = 1..=2, default_values_t = vec!["Junctions".to_string()])]
     pub chim_out_type: Vec<String>,
 
+    /// `Chimeric.out.junction` format: `0` (plain, default) or `1` (append a STAR-Fusion-style
+    /// comment header with the command line and read counts)
+    #[arg(long = "chimOutJunctionFormat", default_value_t = 0)]
+    pub chim_out_junction_format: u8,
+
     /// Full command line as invoked, embedded in the BAM `@PG` `CL:` field.
     #[arg(skip)]
     pub command_line: Option<String>,

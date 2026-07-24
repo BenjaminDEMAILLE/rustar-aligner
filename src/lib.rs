@@ -1295,6 +1295,13 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
 
     // Flush chimeric output if enabled
     if let Some(ref mut chim_writer) = chimeric_writer {
+        if params.chim_out_junction_format == 1 {
+            use std::sync::atomic::Ordering;
+            let command_line = params.command_line.as_deref().unwrap_or("");
+            let n_reads = stats.total_reads.load(Ordering::Relaxed);
+            let n_unique = stats.chimeric_reads.load(Ordering::Relaxed);
+            chim_writer.write_format1_trailer(command_line, n_reads, n_unique, 0)?;
+        }
         chim_writer.flush()?;
         info!("Chimeric junction output complete");
     }
@@ -1854,6 +1861,13 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
 
     // Flush chimeric output if enabled
     if let Some(ref mut chim_writer) = chimeric_writer {
+        if params.chim_out_junction_format == 1 {
+            use std::sync::atomic::Ordering;
+            let command_line = params.command_line.as_deref().unwrap_or("");
+            let n_reads = stats.total_reads.load(Ordering::Relaxed);
+            let n_unique = stats.chimeric_reads.load(Ordering::Relaxed);
+            chim_writer.write_format1_trailer(command_line, n_reads, n_unique, 0)?;
+        }
         chim_writer.flush()?;
     }
 
