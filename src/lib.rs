@@ -31,6 +31,7 @@ pub mod genome;
 pub mod index;
 pub mod io;
 pub mod junction;
+pub mod liftover;
 pub mod mapq;
 pub mod quant;
 pub mod stats;
@@ -70,6 +71,7 @@ pub fn run(params: &Parameters) -> anyhow::Result<()> {
     match params.run_mode {
         RunMode::GenomeGenerate => genome_generate(params),
         RunMode::AlignReads => align_reads(params),
+        RunMode::LiftOver => liftover::run(params),
     }
 }
 

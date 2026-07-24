@@ -35,6 +35,7 @@ pub use sam::{OutSamFormat, OutSamSortOrder, OutSamType, OutSamUnmapped, SamAttr
 pub enum RunMode {
     AlignReads,
     GenomeGenerate,
+    LiftOver,
 }
 
 impl std::str::FromStr for RunMode {
@@ -43,8 +44,9 @@ impl std::str::FromStr for RunMode {
         match s {
             "alignReads" => Ok(Self::AlignReads),
             "genomeGenerate" => Ok(Self::GenomeGenerate),
+            "liftOver" => Ok(Self::LiftOver),
             _ => Err(format!(
-                "unknown runMode '{s}'; expected 'alignReads' or 'genomeGenerate'"
+                "unknown runMode '{s}'; expected 'alignReads', 'genomeGenerate', or 'liftOver'"
             )),
         }
     }
@@ -55,6 +57,7 @@ impl std::fmt::Display for RunMode {
         match self {
             Self::AlignReads => write!(f, "alignReads"),
             Self::GenomeGenerate => write!(f, "genomeGenerate"),
+            Self::LiftOver => write!(f, "liftOver"),
         }
     }
 }
@@ -303,6 +306,12 @@ pub struct Parameters {
     /// FASTA file(s) with genome reference sequences (for genomeGenerate)
     #[arg(long = "genomeFastaFiles", num_args = 1..)]
     pub genome_fasta_files: Vec<PathBuf>,
+
+    /// UCSC chain file(s) for `--runMode liftOver`. Only the first is ever
+    /// used (matches STAR's `Chain` dispatch, whose loop over chain files
+    /// unconditionally exits after the first iteration).
+    #[arg(long = "genomeChainFiles", num_args = 1..)]
+    pub genome_chain_files: Vec<PathBuf>,
 
     /// Length of SA pre-indexing string (log2-based)
     #[arg(long = "genomeSAindexNbases", default_value_t = 14)]
@@ -907,6 +916,38 @@ impl Parameters {
                 ErrorKind::MissingRequiredArgument,
                 "--readFilesIn is required when --runMode alignReads",
             ));
+        }
+
+        // liftOver requires a chain file and a GTF to lift
+        if params.run_mode == RunMode::LiftOver {
+            if params.genome_chain_files.is_empty() {
+                return Err(command.error(
+                    ErrorKind::MissingRequiredArgument,
+                    "--genomeChainFiles is required when --runMode liftOver",
+                ));
+            }
+            if params.sjdb_gtf_file.is_none() {
+                return Err(command.error(
+                    ErrorKind::MissingRequiredArgument,
+                    "--sjdbGTFfile is required when --runMode liftOver",
+                ));
+            }
+        }
+
+        // liftOver requires a chain file and a GTF to lift
+        if params.run_mode == RunMode::LiftOver {
+            if params.genome_chain_files.is_empty() {
+                return Err(command.error(
+                    ErrorKind::MissingRequiredArgument,
+                    "--genomeChainFiles is required when --runMode liftOver",
+                ));
+            }
+            if params.sjdb_gtf_file.is_none() {
+                return Err(command.error(
+                    ErrorKind::MissingRequiredArgument,
+                    "--sjdbGTFfile is required when --runMode liftOver",
+                ));
+            }
         }
 
         // quantMode GeneCounts requires a GTF file
