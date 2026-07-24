@@ -1372,6 +1372,34 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
     let quant = quant_ctx.map(Arc::clone);
     let tr = tr_idx.map(Arc::clone);
 
+    // WASP allele-specific filtering context: load the VCF once, and build the
+    // relaxed re-map parameter set. `None` when --waspOutputMode is not SAMtag.
+    let wasp_ctx: Option<crate::wasp::WaspContext> =
+        if params.wasp_output_mode == params::WaspOutputMode::SAMtag {
+            let vcf = params
+                .var_vcf_file
+                .as_ref()
+                .expect("validated: SAMtag requires --varVCFfile");
+            let ctx = crate::wasp::WaspContext::load(
+                vcf,
+                &index.genome.chr_name,
+                &index.genome.chr_start,
+                params,
+            )
+            .map_err(|source| error::Error::Io {
+                source,
+                path: vcf.clone(),
+            })?;
+            info!(
+                "WASP: loaded {} heterozygous SNVs from {}",
+                ctx.snps.len(),
+                vcf.display()
+            );
+            Some(ctx)
+        } else {
+            None
+        };
+
     info!(
         "Reading paired-end from {} and {}",
         params.read_files_in[0].display(),
@@ -1695,7 +1723,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                         .iter()
                         .map(|pa| PairedAlignment::clone(pa))
                         .collect();
-                    let records = SamWriter::build_paired_records(
+                    let mut records = SamWriter::build_paired_records(
                         &paired_read.name,
                         &m1_seq,
                         &m1_qual,
@@ -1706,6 +1734,19 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                         params,
                         n_for_mapq,
                     )?;
+                    // WASP allele-specific filtering: stamp vW/vA/vG on the pair.
+                    if let Some(ctx) = wasp_ctx.as_ref() {
+                        crate::wasp::annotate_records_pe(
+                            &mut records,
+                            &paired_alns,
+                            &m1_seq,
+                            &m2_seq,
+                            &paired_read.name,
+                            &index,
+                            ctx,
+                            params.out_sam_attributes,
+                        )?;
+                    }
                     for record in records {
                         buffer.push(record);
                     }
