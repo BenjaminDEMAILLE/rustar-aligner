@@ -35,6 +35,8 @@ pub use sam::{OutSamFormat, OutSamSortOrder, OutSamType, OutSamUnmapped, SamAttr
 pub enum RunMode {
     AlignReads,
     GenomeGenerate,
+    InputAlignmentsFromBAM,
+    LiftOver,
 }
 
 impl std::str::FromStr for RunMode {
@@ -43,8 +45,11 @@ impl std::str::FromStr for RunMode {
         match s {
             "alignReads" => Ok(Self::AlignReads),
             "genomeGenerate" => Ok(Self::GenomeGenerate),
+            "inputAlignmentsFromBAM" => Ok(Self::InputAlignmentsFromBAM),
+            "liftOver" => Ok(Self::LiftOver),
             _ => Err(format!(
-                "unknown runMode '{s}'; expected 'alignReads' or 'genomeGenerate'"
+                "unknown runMode '{s}'; expected 'alignReads', 'genomeGenerate', \
+                 'inputAlignmentsFromBAM', or 'liftOver'"
             )),
         }
     }
@@ -55,6 +60,8 @@ impl std::fmt::Display for RunMode {
         match self {
             Self::AlignReads => write!(f, "alignReads"),
             Self::GenomeGenerate => write!(f, "genomeGenerate"),
+            Self::InputAlignmentsFromBAM => write!(f, "inputAlignmentsFromBAM"),
+            Self::LiftOver => write!(f, "liftOver"),
         }
     }
 }
@@ -241,6 +248,61 @@ impl std::str::FromStr for OutFilterType {
 }
 
 // ---------------------------------------------------------------------------
+// SAM primary-flag assignment
+// ---------------------------------------------------------------------------
+
+/// Which alignment(s) get the SAM primary flag (`--outSAMprimaryFlag`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutSamPrimaryFlag {
+    /// Only the single best-tie-broken alignment is primary (STAR default).
+    #[default]
+    OneBestScore,
+    /// Every alignment tied for the best score is marked primary.
+    AllBestScore,
+}
+
+impl std::str::FromStr for OutSamPrimaryFlag {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "OneBestScore" => Ok(Self::OneBestScore),
+            "AllBestScore" => Ok(Self::AllBestScore),
+            _ => Err(format!(
+                "unknown outSAMprimaryFlag value: '{s}'; expected 'OneBestScore' or 'AllBestScore'"
+            )),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SAM read-ID naming
+// ---------------------------------------------------------------------------
+
+/// QNAME source for SAM/FASTX output (`--outSAMreadID`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutSamReadId {
+    /// Use the FASTQ read name as-is (default).
+    #[default]
+    Standard,
+    /// Replace the QNAME with the read's 1-based input index, uniformly across every record
+    /// (mapped, unmapped, FASTX) the read emits.
+    Number,
+}
+
+impl std::str::FromStr for OutSamReadId {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "Standard" => Ok(Self::Standard),
+            "Number" => Ok(Self::Number),
+            _ => Err(format!(
+                "unknown outSAMreadID value: '{s}'; expected 'Standard' or 'Number'"
+            )),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Two-pass mode
 // ---------------------------------------------------------------------------
 
@@ -360,6 +422,12 @@ pub struct Parameters {
     #[arg(long = "genomeFastaFiles", num_args = 1..)]
     pub genome_fasta_files: Vec<PathBuf>,
 
+    /// UCSC chain file(s) for `--runMode liftOver`. Only the first is ever
+    /// used (matches STAR's `Chain` dispatch, whose loop over chain files
+    /// unconditionally exits after the first iteration).
+    #[arg(long = "genomeChainFiles", num_args = 1..)]
+    pub genome_chain_files: Vec<PathBuf>,
+
     /// Length of SA pre-indexing string (log2-based)
     #[arg(long = "genomeSAindexNbases", default_value_t = 14)]
     pub genome_sa_index_nbases: u32,
@@ -371,6 +439,17 @@ pub struct Parameters {
     /// Suffix array sparsity (larger = less RAM, slower mapping)
     #[arg(long = "genomeSAsparseD", default_value_t = 1)]
     pub genome_sa_sparse_d: u32,
+
+    /// Substitute VCF alleles into the genome at genomeGenerate (`None`,
+    /// `Haploid`, or `Diploid`). Requires `--genomeTransformVCF`; incompatible
+    /// with `--sjdbGTFfile`. `Diploid` is genotype-aware and duplicates the
+    /// genome into `_h1`/`_h2` haplotype chromosomes (see `Parameters::validate`)
+    #[arg(long = "genomeTransformType", default_value = "None")]
+    pub genome_transform_type: String,
+
+    /// VCF of variants for `--genomeTransformType`
+    #[arg(long = "genomeTransformVCF")]
+    pub genome_transform_vcf: Option<PathBuf>,
 
     // ── Read files ──────────────────────────────────────────────────────
     /// Input read file(s); second file is mate 2 for paired-end
@@ -412,6 +491,23 @@ pub struct Parameters {
     /// Output file name prefix (including path)
     #[arg(long = "outFileNamePrefix", default_value = "./")]
     pub out_file_name_prefix: String,
+
+    /// (`--runMode inputAlignmentsFromBAM`) the input BAM to re-process
+    #[arg(long = "inputBAMfile", default_value = "-")]
+    pub input_bam_file: String,
+
+    /// (`--runMode inputAlignmentsFromBAM`) mark PCR duplicates in the input BAM: `-` = off,
+    /// `UniqueIdentical` (marks multimappers too) or `UniqueIdenticalNotMulti` (leaves them unmarked)
+    #[arg(long = "bamRemoveDuplicatesType", default_value = "-")]
+    pub bam_remove_duplicates_type: String,
+
+    /// Compare this many mate-2 SEQ bases when deduplicating (RAMPAGE); 0 = don't compare SEQ
+    #[arg(
+        long = "bamRemoveDuplicatesMate2basesN",
+        default_value_t = 0,
+        allow_hyphen_values = true
+    )]
+    pub bam_remove_duplicates_mate2_bases_n: i64,
 
     #[command(flatten)]
     pub out_sam_type: OutSamType,
@@ -466,6 +562,32 @@ pub struct Parameters {
     /// Max number of multiple alignments per read in SAM output (-1 = all)
     #[arg(long = "outSAMmultNmax", default_value_t = -1, allow_hyphen_values = true)]
     pub out_sam_mult_nmax: i32,
+
+    /// Bits OR-ed into every mapped record's FLAG (`--outSAMflagOR`, default 0)
+    #[arg(long = "outSAMflagOR", default_value_t = 0)]
+    pub out_sam_flag_or: u32,
+
+    /// Bits AND-ed into every mapped record's FLAG (`--outSAMflagAND`, default 65535 = keep all)
+    #[arg(long = "outSAMflagAND", default_value_t = 65535)]
+    pub out_sam_flag_and: u32,
+
+    /// Which alignment(s) get the SAM primary flag: `OneBestScore` (default) or `AllBestScore`
+    #[arg(long = "outSAMprimaryFlag", default_value = "OneBestScore")]
+    pub out_sam_primary_flag: OutSamPrimaryFlag,
+
+    /// Start value of the `HI` SAM attribute (STAR default 1; CellRanger convention uses 0)
+    #[arg(long = "outSAMattrIHstart", default_value_t = 1)]
+    pub out_sam_attr_ih_start: u32,
+
+    /// QNAME source for SAM/FASTX output: `Standard` (default, the FASTQ read name) or
+    /// `Number` (the read's 1-based input index)
+    #[arg(long = "outSAMreadID", default_value = "Standard")]
+    pub out_sam_read_id: OutSamReadId,
+
+    /// TLEN calculation: 1 (default, whole combined-transcript span) or 2 (per-mate span,
+    /// signed by whichever mate is genomically leftmost)
+    #[arg(long = "outSAMtlen", default_value_t = 1)]
+    pub out_sam_tlen: u8,
 
     /// Output filter type: Normal or BySJout
     #[arg(long = "outFilterType", default_value = "Normal")]
@@ -680,6 +802,11 @@ pub struct Parameters {
     #[arg(long = "sjdbGTFfile")]
     pub sjdb_gtf_file: Option<PathBuf>,
 
+    /// TSV file(s) of `chr start end [strand]` junctions (1-based intron first/last base) to
+    /// insert into the sjdb, unioned with any `--sjdbGTFfile` junctions
+    #[arg(long = "sjdbFileChrStartEnd", num_args = 1..)]
+    pub sjdb_file_chr_start_end: Vec<PathBuf>,
+
     /// Prefix to add to chromosome names from GTF file (e.g. "chr" when GTF uses bare numbers)
     #[arg(long = "sjdbGTFchrPrefix", default_value = "")]
     pub sjdb_gtf_chr_prefix: String,
@@ -698,6 +825,20 @@ pub struct Parameters {
     /// GTF attribute name for parent gene ID of exon features
     #[arg(long = "sjdbGTFtagExonParentGene", default_value = "gene_id")]
     pub sjdb_gtf_tag_exon_parent_gene: String,
+
+    /// GTF attribute name(s) for parent gene name of exon features; when several are given and
+    /// several match, the last one in the list wins
+    #[arg(long = "sjdbGTFtagExonParentGeneName", default_values_t = vec!["gene_name".to_string()], num_args = 1..)]
+    pub sjdb_gtf_tag_exon_parent_gene_name: Vec<String>,
+
+    /// GTF attribute name(s) for parent gene type of exon features; when several are given and
+    /// several match, the last one in the list wins
+    #[arg(
+        long = "sjdbGTFtagExonParentGeneType",
+        default_values_t = vec!["gene_type".to_string(), "gene_biotype".to_string()],
+        num_args = 1..
+    )]
+    pub sjdb_gtf_tag_exon_parent_gene_type: Vec<String>,
 
     /// Overhang length for splice junction database
     #[arg(long = "sjdbOverhang", default_value_t = 100)]
@@ -883,6 +1024,10 @@ pub struct Parameters {
     /// variant matches CellRanger > 3.0.
     #[arg(long = "soloUMIfiltering", num_args = 1.., default_values_t = vec!["-".to_string()])]
     pub solo_umi_filtering: Vec<String>,
+    /// `Chimeric.out.junction` format: `0` (plain, default) or `1` (append a STAR-Fusion-style
+    /// comment header with the command line and read counts)
+    #[arg(long = "chimOutJunctionFormat", default_value_t = 0)]
+    pub chim_out_junction_format: u8,
 
     /// Full command line as invoked, embedded in the BAM `@PG` `CL:` field.
     #[arg(skip)]
@@ -1107,6 +1252,71 @@ impl Parameters {
                 ErrorKind::MissingRequiredArgument,
                 "--readFilesIn is required when --runMode alignReads",
             ));
+        }
+
+        // --genomeTransformType: Haploid and Diploid are implemented. Both require
+        // a VCF, and are incompatible with a GTF (STAR itself doesn't combine
+        // genomeTransform with sjdb annotation at genomeGenerate).
+        if !params.genome_transform_type.eq_ignore_ascii_case("None") {
+            if !params.genome_transform_type.eq_ignore_ascii_case("Haploid")
+                && !params.genome_transform_type.eq_ignore_ascii_case("Diploid")
+            {
+                return Err(command.error(
+                    ErrorKind::InvalidValue,
+                    "--genomeTransformType must be None, Haploid, or Diploid",
+                ));
+            }
+            if params.genome_transform_vcf.is_none() {
+                return Err(command.error(
+                    ErrorKind::MissingRequiredArgument,
+                    "--genomeTransformType Haploid/Diploid requires --genomeTransformVCF",
+                ));
+            }
+            if params.sjdb_gtf_file.is_some() {
+                return Err(command.error(
+                    ErrorKind::InvalidValue,
+                    "--genomeTransformType is incompatible with --sjdbGTFfile",
+                ));
+            }
+        }
+
+        // inputAlignmentsFromBAM: only --bamRemoveDuplicatesType is implemented so far
+        if params.run_mode == RunMode::InputAlignmentsFromBAM {
+            let dedup = params.bam_remove_duplicates_type.as_str();
+            if dedup == "-" {
+                return Err(command.error(
+                    ErrorKind::MissingRequiredArgument,
+                    "--runMode inputAlignmentsFromBAM requires --bamRemoveDuplicatesType \
+                     (UniqueIdentical or UniqueIdenticalNotMulti)",
+                ));
+            }
+            if !dedup.eq_ignore_ascii_case("UniqueIdentical")
+                && !dedup.eq_ignore_ascii_case("UniqueIdenticalNotMulti")
+            {
+                return Err(command.error(
+                    ErrorKind::InvalidValue,
+                    format!(
+                        "unknown --bamRemoveDuplicatesType {dedup}; expected UniqueIdentical or \
+                         UniqueIdenticalNotMulti"
+                    ),
+                ));
+            }
+        }
+
+        // liftOver requires a chain file and a GTF to lift
+        if params.run_mode == RunMode::LiftOver {
+            if params.genome_chain_files.is_empty() {
+                return Err(command.error(
+                    ErrorKind::MissingRequiredArgument,
+                    "--genomeChainFiles is required when --runMode liftOver",
+                ));
+            }
+            if params.sjdb_gtf_file.is_none() {
+                return Err(command.error(
+                    ErrorKind::MissingRequiredArgument,
+                    "--sjdbGTFfile is required when --runMode liftOver",
+                ));
+            }
         }
 
         // quantMode GeneCounts requires a GTF file

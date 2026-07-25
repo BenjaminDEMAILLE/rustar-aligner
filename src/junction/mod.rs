@@ -5,6 +5,7 @@
 /// - Building a junction database from annotated exons
 /// - Junction lookup during alignment (annotated vs novel)
 /// - Junction statistics collection for SJ.out.tab output
+pub(crate) mod chr_start_end;
 pub(crate) mod gtf;
 mod sj_output;
 pub mod sjdb_insert;
@@ -414,6 +415,7 @@ mod tests {
 
         // Two-chromosome toy genome so chr_start[1] != 0.
         let genome = Genome {
+            transform_blocks: None,
             sequence: vec![0; 4000].into(),
             n_genome: 2000,
             n_genome_real: 2000,

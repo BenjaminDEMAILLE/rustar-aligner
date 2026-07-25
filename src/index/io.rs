@@ -123,6 +123,8 @@ impl GenomeIndex {
                 &genome,
                 &params.sjdb_gtf_tag_exon_parent_transcript,
                 &params.sjdb_gtf_tag_exon_parent_gene,
+                &params.sjdb_gtf_tag_exon_parent_gene_name,
+                &params.sjdb_gtf_tag_exon_parent_gene_type,
             )?)
         } else {
             None
@@ -241,6 +243,9 @@ fn load_genome(genome_dir: &Path, _params: &Parameters) -> Result<Genome, Error>
         chr_name,
         chr_length,
         chr_start,
+        // Loading transformGenomeBlocks.tsv back is only needed for the
+        // (not yet implemented) align-time back-transform.
+        transform_blocks: None,
     })
 }
 
