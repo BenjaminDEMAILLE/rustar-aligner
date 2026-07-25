@@ -233,10 +233,47 @@ impl SpliceJunctionStats {
     ) -> Result<(), Error> {
         let file = File::create(output_path).map_err(|e| Error::io(e, output_path))?;
         let mut writer = BufWriter::new(file);
+        let written = self.write_sj_lines(&mut writer, genome, params)?;
+        writer.flush().map_err(|e| Error::io(e, output_path))?;
+        let filtered = self.junctions.len() as u32 - written;
+        log::info!(
+            "Wrote {} junctions to {} ({} filtered by outSJfilter*)",
+            written,
+            output_path.display(),
+            filtered,
+        );
+        Ok(())
+    }
 
+    /// Surviving junctions sorted by (chr, intron_start, intron_end) — the
+    /// canonical `SJ.out.tab` order, which is also the row order of the `SJ`
+    /// solo-feature matrix. Returns the (intron_start, intron_end) absolute-coord
+    /// keys so the SJ recorder can be mapped to matrix rows.
+    pub(crate) fn sj_feature_order(&self, params: &Parameters) -> Vec<(u64, u64)> {
         let surviving = self.compute_surviving_junctions(params);
+        let mut keys: Vec<(usize, u64, u64)> = self
+            .junctions
+            .iter()
+            .filter(|e| surviving.contains(e.key()))
+            .map(|e| {
+                let k = e.key();
+                (k.chr_idx, k.intron_start, k.intron_end)
+            })
+            .collect();
+        keys.sort_unstable();
+        keys.into_iter().map(|(_, s, e)| (s, e)).collect()
+    }
 
-        // Collect and sort surviving junctions for deterministic output
+    /// Write the 9-column `SJ.out.tab` lines (sorted) to `writer`; returns the
+    /// number written. Shared by `write_output` and the SJ feature's
+    /// `features.tsv`, so both stay in the same order as the SJ matrix rows.
+    pub(crate) fn write_sj_lines(
+        &self,
+        writer: &mut dyn std::io::Write,
+        genome: &Genome,
+        params: &Parameters,
+    ) -> Result<u32, Error> {
+        let surviving = self.compute_surviving_junctions(params);
         let mut output_junctions: Vec<_> = self
             .junctions
             .iter()
@@ -267,11 +304,9 @@ impl SpliceJunctionStats {
                 .chr_name
                 .get(key.chr_idx)
                 .ok_or_else(|| Error::Index("Invalid chromosome index in junction".to_string()))?;
-
             let chr_start_pos = genome.chr_start[key.chr_idx];
             let chr_pos_start = key.intron_start - chr_start_pos + 1;
             let chr_pos_end = key.intron_end - chr_start_pos + 1;
-
             writeln!(
                 writer,
                 "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
@@ -285,21 +320,10 @@ impl SpliceJunctionStats {
                 multi,
                 max_overhang
             )
-            .map_err(|e| Error::io(e, output_path))?;
+            .map_err(|e| Error::Index(format!("SJ write: {e}")))?;
             written += 1;
         }
-
-        writer.flush().map_err(|e| Error::io(e, output_path))?;
-
-        let filtered = self.junctions.len() as u32 - written;
-        log::info!(
-            "Wrote {} junctions to {} ({} filtered by outSJfilter*)",
-            written,
-            output_path.display(),
-            filtered,
-        );
-
-        Ok(())
+        Ok(written)
     }
 
     /// Get the number of unique junctions tracked
@@ -528,7 +552,7 @@ mod tests {
         stats.record_junction(0, 300, 400, 2, SpliceMotif::GcAg, false, 15, true);
 
         let genome = Genome {
-            sequence: vec![0; 1000],
+            sequence: vec![0; 1000].into(),
             n_genome: 1000,
             n_genome_real: 1000,
             n_chr_real: 1,
@@ -589,7 +613,7 @@ mod tests {
         stats.record_junction(0, 300, 400, 1, SpliceMotif::GtAg, true, 20, false);
 
         let genome = Genome {
-            sequence: vec![0; 1000],
+            sequence: vec![0; 1000].into(),
             n_genome: 1000,
             n_genome_real: 1000,
             n_chr_real: 1,
@@ -624,7 +648,7 @@ mod tests {
         stats.record_junction(0, 100, 200, 1, SpliceMotif::NonCanonical, true, 2, true);
 
         let genome = Genome {
-            sequence: vec![0; 1000],
+            sequence: vec![0; 1000].into(),
             n_genome: 1000,
             n_genome_real: 1000,
             n_chr_real: 1,
@@ -716,7 +740,7 @@ mod tests {
         }
 
         let genome = Genome {
-            sequence: vec![0; 1000],
+            sequence: vec![0; 1000].into(),
             n_genome: 1000,
             n_genome_real: 1000,
             n_chr_real: 1,

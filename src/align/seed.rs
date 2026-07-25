@@ -108,7 +108,15 @@ impl Seed {
                 .then_with(|| b.length.cmp(&a.length))
         });
         {
-            let mut seen = std::collections::HashSet::new();
+            // STAR storeAligns dedup: drop exact (rStart, Length) duplicates
+            // regardless of search direction (main #5 / #112 — direction-agnostic
+            // key). Integer-keyed via FxHash + pre-sized for speed (PR #90 perf:
+            // default SipHash + growth-rehash showed up in profiling).
+            let mut seen: rustc_hash::FxHashSet<(usize, usize)> =
+                rustc_hash::FxHashSet::with_capacity_and_hasher(
+                    seeds.len(),
+                    rustc_hash::FxBuildHasher,
+                );
             seeds.retain(|s| seen.insert((s.read_pos, s.length)));
         }
 
@@ -475,8 +483,41 @@ fn compare_seq_to_genome(
 
     let remaining = read_seq.len() - read_pos;
     let mut match_len = l_start;
+    let mut i = l_start;
 
-    for i in l_start..remaining {
+    // SIMD fast path: forward-strand hits (`!is_reverse`) scan a genuinely
+    // contiguous byte range directly from the genome's physical forward
+    // buffer — both `GenomeSeq::Owned` and `::Mapped` store the forward
+    // strand contiguously (see `GenomeSeq::as_slice`), unlike the
+    // reverse-complement half, which `GenomeSeq::base` computes per-byte on
+    // the fly (no contiguous byte range exists to scan). Bounded strictly to
+    // `genome_start+i < n_genome` (NOT `sequence.len()`, which is `2*n_genome`
+    // and would let this slice run into the RC-mirror continuation the
+    // scalar loop below still walks correctly — see its boundary check) so
+    // this fast path can never diverge from the exact original semantics.
+    if !is_reverse {
+        let n_genome = index.genome.n_genome as usize;
+        if genome_start < n_genome {
+            let genome_slice_all = index.genome.sequence.as_slice();
+            let simd_end = remaining.min(n_genome.min(genome_slice_all.len()) - genome_start);
+            if simd_end > i {
+                let read_chunk = &read_seq[read_pos + i..read_pos + simd_end];
+                let genome_chunk = &genome_slice_all[genome_start + i..genome_start + simd_end];
+                if let Some(off) = crate::align::simd_scan::find_stop(read_chunk, genome_chunk) {
+                    let genome_base = genome_chunk[off];
+                    if genome_base >= 5 {
+                        return (i + off, true);
+                    }
+                    let read_base = read_chunk[off];
+                    return (i + off, read_base > genome_base);
+                }
+                match_len = simd_end;
+                i = simd_end;
+            }
+        }
+    }
+
+    for i in i..remaining {
         let genome_idx = genome_start + i;
 
         if genome_idx >= index.genome.sequence.len() {
@@ -484,7 +525,7 @@ fn compare_seq_to_genome(
             return (match_len, true);
         }
 
-        let genome_base = index.genome.sequence[genome_idx];
+        let genome_base = index.genome.sequence.base(genome_idx);
 
         if genome_base >= 5 {
             // Padding character — STAR returns comp_res > 0 (read > genome)
@@ -545,6 +586,16 @@ fn max_mappable_length(
     // Binary search within SA range
     while i1 + 1 < i2 {
         i3 = median_uint2(i1, i2);
+        // Prefetch the SA entries of the two possible next probes so their
+        // (random, mmap-backed) bytes arrive while the current probe's genome
+        // comparison runs. Whichever branch is taken below, its midpoint is one
+        // of these two. Hint only — does not change results.
+        if i1 + 1 < i3 {
+            index.suffix_array.prefetch(median_uint2(i1, i3));
+        }
+        if i3 + 1 < i2 {
+            index.suffix_array.prefetch(median_uint2(i3, i2));
+        }
         let comp3;
         (l3, comp3) = compare_seq_to_genome(read_seq, read_pos, index, i3, l);
 

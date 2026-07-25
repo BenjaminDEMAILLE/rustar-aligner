@@ -373,7 +373,9 @@ pub fn cluster_seeds(
     read_len: usize,
     _debug: bool,
 ) -> Vec<SeedCluster> {
-    use std::collections::HashMap;
+    // Integer-keyed maps in this hot path (the #1 align hotspot, ~19% self-time):
+    // FxHash, not the default SipHash, and pre-sized to avoid rehashing.
+    use rustc_hash::{FxBuildHasher, FxHashMap};
 
     let win_bin_nbits = params.win_bin_nbits;
     let win_anchor_dist_nbins = params.win_anchor_dist_nbins;
@@ -395,34 +397,39 @@ pub fn cluster_seeds(
     // entry for hits confined to a single flank, two entries for hits
     // that straddle the donor/acceptor boundary (so the stitch DP can
     // chain them through its splice branch).
-    let expand_hit = |sa_pos: u64, strand: bool, length: usize| -> Vec<(u64, usize, usize, u64)> {
-        let raw_fwd = index.sa_pos_to_forward(sa_pos, strand, length);
-        if raw_fwd < n_genome_real {
-            return vec![(raw_fwd, 0, length, sa_pos)];
-        }
-        if sjdb_overhang == 0 || prepared.is_empty() {
-            return Vec::new();
-        }
-        let mut decoded = crate::junction::sjdb_insert::decode_gsj_hit(
-            raw_fwd,
-            length,
-            n_genome_real,
-            sjdb_overhang,
-            prepared,
-        );
-        // Reverse-strand hits traverse the donor/acceptor halves in reverse
-        // read order: the leftmost forward bytes (donor flank) align to the
-        // last read bases. Swap the read offsets so each sub-seed's
-        // `read_pos = seed.read_pos + read_offset` lands at the right place
-        // in original-read coords.
-        if strand && decoded.len() == 2 {
-            let acceptor_len = decoded[1].2;
-            decoded[0].1 = acceptor_len;
-            decoded[1].1 = 0;
-        }
-        decoded
-            .into_iter()
-            .map(|(real_fwd, read_off, sub_len)| {
+    // Returns at most 2 entries (a single real-genome hit, or a donor+acceptor
+    // pair from `decode_gsj_hit` — never more, see that function). A fixed
+    // `[Option<T>; 2]` avoids a heap `Vec` allocation on every SA hit expanded
+    // in this hot loop (the common `raw_fwd < n_genome_real` case is the
+    // overwhelming majority of calls); iterate with `.into_iter().flatten()`.
+    let expand_hit =
+        |sa_pos: u64, strand: bool, length: usize| -> [Option<(u64, usize, usize, u64)>; 2] {
+            let raw_fwd = index.sa_pos_to_forward(sa_pos, strand, length);
+            if raw_fwd < n_genome_real {
+                return [Some((raw_fwd, 0, length, sa_pos)), None];
+            }
+            if sjdb_overhang == 0 || prepared.is_empty() {
+                return [None, None];
+            }
+            let mut decoded = crate::junction::sjdb_insert::decode_gsj_hit(
+                raw_fwd,
+                length,
+                n_genome_real,
+                sjdb_overhang,
+                prepared,
+            );
+            // Reverse-strand hits traverse the donor/acceptor halves in reverse
+            // read order: the leftmost forward bytes (donor flank) align to the
+            // last read bases. Swap the read offsets so each sub-seed's
+            // `read_pos = seed.read_pos + read_offset` lands at the right place
+            // in original-read coords.
+            if strand && decoded.len() == 2 {
+                let acceptor_len = decoded[1].2;
+                decoded[0].1 = acceptor_len;
+                decoded[1].1 = 0;
+            }
+            let mut out = [None, None];
+            for (slot, (real_fwd, read_off, sub_len)) in out.iter_mut().zip(decoded) {
                 let sub_sa_pos = if strand {
                     n_genome
                         .saturating_sub(real_fwd)
@@ -430,10 +437,10 @@ pub fn cluster_seeds(
                 } else {
                     real_fwd
                 };
-                (real_fwd, read_off, sub_len, sub_sa_pos)
-            })
-            .collect()
-    };
+                *slot = Some((real_fwd, read_off, sub_len, sub_sa_pos));
+            }
+            out
+        };
 
     let anchor_set: Vec<bool> = seeds
         .iter()
@@ -478,10 +485,12 @@ pub fn cluster_seeds(
         wa_lrec: usize,
     }
 
-    let mut windows: Vec<Window> = Vec::new();
+    // At most one window per anchor position — pre-size to avoid growth reallocs.
+    let mut windows: Vec<Window> = Vec::with_capacity(anchor_indices.len());
     // winBin: (strand, bin) → window_index
     // Chromosome is implicit since bins are from absolute forward positions
-    let mut win_bin: HashMap<(bool, u64), usize> = HashMap::new();
+    let mut win_bin: FxHashMap<(bool, u64), usize> =
+        FxHashMap::with_capacity_and_hasher(anchor_indices.len() * 2, FxBuildHasher);
 
     for &anchor_idx in &anchor_indices {
         let anchor = &seeds[anchor_idx];
@@ -502,6 +511,8 @@ pub fn cluster_seeds(
 
             for (forward_pos, _read_off, sub_length, _sub_sa_pos) in
                 expand_hit(sa_pos, strand, full_length)
+                    .into_iter()
+                    .flatten()
             {
                 // Anchor sub-pieces shorter than the minimum still drive a
                 // window centre — STAR seeds new windows from Gsj hits even
@@ -689,6 +700,8 @@ pub fn cluster_seeds(
 
             for (forward_pos, read_off, sub_length, sub_sa_pos) in
                 expand_hit(sa_pos, strand, full_length)
+                    .into_iter()
+                    .flatten()
             {
                 let length = sub_length;
                 let chr_idx = match index.genome.position_to_chr(forward_pos) {
@@ -742,6 +755,14 @@ pub fn cluster_seeds(
         .map(|i| vec![false; win_candidates[i].len()])
         .collect();
 
+    // Hoisted out of the per-window loop: the sort buffer and the diagonal map
+    // (with its hash table) are allocated once per read and reused across
+    // windows via `clear()` — previously this was O(windows) fresh allocations
+    // + hash-table rehashes per read (a measured allocator hotspot). Reused
+    // storage only; the results are identical.
+    let mut by_len: Vec<usize> = Vec::new();
+    let mut diag_ranges: FxHashMap<(i64, u8), Vec<(usize, usize)>> = FxHashMap::default();
+
     for win_idx in 0..win_n {
         let candidates = &win_candidates[win_idx];
         if candidates.is_empty() {
@@ -749,13 +770,14 @@ pub fn cluster_seeds(
         }
         // Sort indices by length descending so that the longest entry per diagonal
         // is processed first (and blocks shorter overlapping entries on the same diagonal).
-        let mut by_len: Vec<usize> = (0..candidates.len()).collect();
+        by_len.clear();
+        by_len.extend(0..candidates.len());
         by_len.sort_by(|&a, &b| candidates[b].length.cmp(&candidates[a].length));
 
         // For each (diagonal, mate_id) pair, track accepted [ps_rstart, ps_rend) ranges.
         // STAR's assignAlignToWindow checks aFrag==WA[iA][WA_iFrag] before overlap test:
         // seeds from different fragments are never treated as overlapping duplicates.
-        let mut diag_ranges: HashMap<(i64, u8), Vec<(usize, usize)>> = HashMap::new();
+        diag_ranges.clear();
         for &ci in &by_len {
             let cand = &candidates[ci];
             let diag = cand.forward_pos as i64 - cand.ps_rstart as i64;
@@ -2674,7 +2696,7 @@ pub(crate) fn stitch_seeds_core(
     // redundant seeds cover the same diagonal region.
     // Uses positive-strand coordinates consistent with cluster_seeds overlap detection.
     {
-        use std::collections::HashMap;
+        use rustc_hash::{FxHashMap, FxHashSet};
         let read_len = read_seq.len();
         let is_rev = cluster.is_reverse;
         // For each (diagonal, mate_id) pair, find the longest seed per merged interval.
@@ -2682,7 +2704,7 @@ pub(crate) fn stitch_seeds_core(
         // seeds from different fragments are never treated as duplicates.
         type DiagMateKey = (i64, u8);
         type DiagSeeds = Vec<(usize, usize, usize)>;
-        let mut diag_seeds: HashMap<DiagMateKey, DiagSeeds> = HashMap::new();
+        let mut diag_seeds: FxHashMap<DiagMateKey, DiagSeeds> = FxHashMap::default();
         for (idx, wa) in wa_entries.iter().enumerate() {
             let ps = if is_rev {
                 read_len - (wa.length + wa.read_pos)
@@ -2696,7 +2718,7 @@ pub(crate) fn stitch_seeds_core(
                 .push((ps, ps + wa.length, idx));
         }
 
-        let mut keep_indices = std::collections::HashSet::new();
+        let mut keep_indices = FxHashSet::default();
         for (_diag, mut seeds) in diag_seeds {
             // Sort by start position
             seeds.sort_unstable();
@@ -3015,7 +3037,7 @@ mod tests {
         }
 
         let genome = Genome {
-            sequence,
+            sequence: sequence.into(),
             n_genome,
             n_genome_real: n_genome,
             n_chr_real: 1,
@@ -3137,7 +3159,7 @@ mod tests {
         }
 
         let genome = Genome {
-            sequence,
+            sequence: sequence.into(),
             n_genome,
             n_genome_real: n_genome,
             n_chr_real: 1,

@@ -66,7 +66,7 @@ impl GenomeIndex {
         } = Self::build_prep(params)?;
 
         log::info!("Building suffix array...");
-        let suffix_array = SuffixArray::build(&genome)?;
+        let suffix_array = SuffixArray::build_sparse(&genome, params.genome_sa_sparse_d as u64)?;
         log::info!("Suffix array built: {} entries", suffix_array.len());
 
         log::info!("Building SA index...");
@@ -160,8 +160,11 @@ impl GenomeIndex {
         let mut sa_writer = PackedStreamWriter::new(sa_buf, word_length);
 
         log::info!("Building suffix array...");
-        let (got_gbit, got_gmask, n_entries) =
-            sa_build::build_streaming(&genome, params.temp_dir.as_deref(), |packed_value| {
+        let (got_gbit, got_gmask, n_entries) = sa_build::build_streaming(
+            &genome,
+            params.temp_dir.as_deref(),
+            params.genome_sa_sparse_d as u64,
+            |packed_value| {
                 // Emit is now lightweight: just bit-pack into the SA
                 // file. caps-sa's phase-4 emit loop is single-threaded,
                 // so anything we do here serialises the whole build.
@@ -171,7 +174,8 @@ impl GenomeIndex {
                     .write_one(packed_value)
                     .map_err(|e| Error::io(e, &sa_path))?;
                 Ok(())
-            })?;
+            },
+        )?;
         debug_assert_eq!(got_gbit, gstrand_bit);
         debug_assert_eq!(got_gmask, gstrand_mask);
         log::info!("Suffix array streamed to disk: {n_entries} entries");

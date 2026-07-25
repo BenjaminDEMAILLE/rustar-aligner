@@ -434,7 +434,7 @@ mod tests {
     fn make_genome_2chr() -> crate::genome::Genome {
         use crate::genome::Genome;
         Genome {
-            sequence: vec![0u8; 2048],
+            sequence: vec![0u8; 2048].into(),
             n_genome: 1024,
             n_genome_real: 1024,
             n_chr_real: 2,

@@ -465,7 +465,7 @@ mod tests {
 
     fn create_test_genome() -> Genome {
         Genome {
-            sequence: vec![0, 1, 2, 3, 0, 1, 2, 3], // ACGTACGT
+            sequence: vec![0, 1, 2, 3, 0, 1, 2, 3].into(), // ACGTACGT
             n_genome: 8,
             n_genome_real: 8,
             n_chr_real: 1,

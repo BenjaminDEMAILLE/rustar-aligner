@@ -634,7 +634,7 @@ mod tests {
         }
 
         Genome {
-            sequence,
+            sequence: sequence.into(),
             n_genome,
             n_genome_real: n_genome,
             n_chr_real: 1,

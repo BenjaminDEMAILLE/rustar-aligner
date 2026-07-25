@@ -1200,7 +1200,7 @@ fn extend_softclips(
                 break;
             }
             let r1 = read_bases_align_orientation[r_idx];
-            let g1 = genome.sequence[g_idx];
+            let g1 = genome.sequence.base(g_idx);
             if r1 != g1 && r1 < 4 && g1 < 4 {
                 n_mm_extra += 1;
             }
@@ -1220,7 +1220,7 @@ fn extend_softclips(
                 break;
             }
             let r1 = read_bases_align_orientation[r_idx];
-            let g1 = genome.sequence[g_idx];
+            let g1 = genome.sequence.base(g_idx);
             if r1 != g1 && r1 < 4 && g1 < 4 {
                 n_mm_extra += 1;
             }
@@ -1378,7 +1378,7 @@ mod tests {
 
     fn make_genome() -> Genome {
         Genome {
-            sequence: vec![0u8; 3000],
+            sequence: vec![0u8; 3000].into(),
             n_genome: 3000,
             n_genome_real: 3000,
             n_chr_real: 2,
@@ -2293,7 +2293,7 @@ mod tests {
         // Aligned region [104, 144) — fill with zeros (A) so read bases match
         seq[104..144].fill(0);
         let genome = Genome {
-            sequence: seq,
+            sequence: seq.into(),
             n_genome: 1000,
             n_genome_real: 1000,
             n_chr_real: 1,
@@ -2346,7 +2346,7 @@ mod tests {
         // Aligned region [104, 144): all zeros
         seq[104..144].fill(0);
         let genome = Genome {
-            sequence: seq,
+            sequence: seq.into(),
             n_genome: 1000,
             n_genome_real: 1000,
             n_chr_real: 1,
