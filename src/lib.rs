@@ -165,6 +165,19 @@ impl AlignmentWriter for NullWriter {
     }
 }
 
+#[cfg(all(feature = "htslib-bam", not(windows)))]
+impl AlignmentWriter for crate::io::bam_htslib::HtslibBamWriter {
+    fn write_batch(
+        &mut self,
+        batch: &[noodles::sam::alignment::record_buf::RecordBuf],
+    ) -> Result<(), error::Error> {
+        crate::io::bam_htslib::HtslibBamWriter::write_batch(self, batch)
+    }
+    fn finish(&mut self) -> Result<(), error::Error> {
+        crate::io::bam_htslib::HtslibBamWriter::finish(self)
+    }
+}
+
 impl AlignmentWriter for crate::io::sam::SamWriter {
     fn write_batch(
         &mut self,
@@ -729,6 +742,21 @@ fn run_single_pass(
             }
         },
     };
+
+    // `--outSAMtype BAM Unsorted` to a file is the one path where BAM writing
+    // can dominate a run, so it is the only one the htslib backend takes over.
+    // Everything else keeps the default writer, including stdout and the sorted
+    // path, which have their own constraints.
+    #[cfg(all(feature = "htslib-bam", not(windows)))]
+    if params.out_std == OutStd::None && matches!(out_type.format, OutSamFormat::Bam) {
+        let path = params.output_path("Aligned.out.bam");
+        log::info!("Writing unsorted BAM through htslib (feature htslib-bam)");
+        writer = Box::new(crate::io::bam_htslib::HtslibBamWriter::create(
+            &path,
+            &index.genome,
+            params,
+        )?);
+    }
 
     // Align reads through the boxed writer.
     //

@@ -66,6 +66,21 @@ libmimalloc-sys = { version = "0.1.49", features = ["extended"] } # mi_option_se
 libdeflater = "1.25.2"
 noodles-bgzf = { version = "0.49", features = ["libdeflate"] }
 
+# Optional BAM writer backend. htslib's own multithreaded BGZF writer, which is
+# a genuinely parallel deflate rather than a layer over the same single
+# compressor. Off by default and never built on Windows: rust-htslib ships
+# pre-built bindings for Mac and Linux only, its README calls Windows bindgen
+# untested, and its CI has no Windows job. `default-features = false` drops
+# bzip2-sys and lzma-sys, which are only needed for CRAM.
+[target.'cfg(not(windows))'.dependencies]
+rust-htslib = { version = "0.49", optional = true, default-features = false }
+
+[features]
+default = []
+# Select htslib as the BAM writer. Output is required to be identical to the
+# default noodles backend; see `io::bam_htslib`.
+htslib-bam = ["dep:rust-htslib"]
+
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"

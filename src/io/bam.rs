@@ -298,6 +298,16 @@ fn write_bam_header_lenient<W: Write>(
     Ok(())
 }
 
+/// The SAM header text this run would write, as bytes.
+///
+/// Exposed so an alternative BAM backend can be handed exactly the header the
+/// default one produces, rather than assembling its own and risking a
+/// difference the differential test would then have to chase.
+#[cfg(all(feature = "htslib-bam", not(windows)))]
+pub(crate) fn render_sam_header_text(header: &sam::Header, sort_order: Option<&str>) -> Vec<u8> {
+    render_sam_text_lenient(header, sort_order)
+}
+
 fn render_sam_text_lenient(header: &sam::Header, sort_order: Option<&str>) -> Vec<u8> {
     let mut buf: Vec<u8> = Vec::new();
 
@@ -454,6 +464,29 @@ impl SortedBamStdoutWriter {
         );
         Ok(())
     }
+}
+
+/// One record rendered as a SAM line, without a trailing newline.
+///
+/// The route into an alternative backend: htslib can parse a SAM line into its
+/// own record type, so going through text means both backends start from the
+/// same `RecordBuf` and cannot drift in how fields are encoded.
+#[cfg(all(feature = "htslib-bam", not(windows)))]
+pub(crate) fn render_sam_record_line(
+    header: &sam::Header,
+    record: &RecordBuf,
+) -> Result<String, Error> {
+    use noodles::sam::alignment::io::Write as _;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut w = noodles::sam::io::Writer::new(&mut buf);
+    w.write_alignment_record(header, record)
+        .map_err(|e| Error::Alignment(format!("render SAM record: {e}")))?;
+    let mut line =
+        String::from_utf8(buf).map_err(|e| Error::Alignment(format!("render SAM record: {e}")))?;
+    while line.ends_with('\n') || line.ends_with('\r') {
+        line.pop();
+    }
+    Ok(line)
 }
 
 #[cfg(test)]
