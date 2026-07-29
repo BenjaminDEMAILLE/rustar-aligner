@@ -12,6 +12,7 @@
 pub mod count;
 pub mod gene;
 pub mod smartseq;
+pub mod transcript3p;
 pub mod whitelist;
 
 pub use count::{UmiDedup, UmiFiltering, write_gene_matrix};
@@ -564,6 +565,11 @@ pub struct SoloContext {
     /// `--soloMultiMappers` includes a non-`Unique` method → capture gene-
     /// ambiguous reads for distribution into `UniqueAndMult-*.mtx`.
     pub want_multi: bool,
+    /// `--soloFeatures Transcript3p`: the transcriptome to assign reads to, and
+    /// the accumulated per-read records. Both `None`/absent unless asked for,
+    /// since building the transcriptome costs a GTF pass.
+    pub transcriptome: Option<crate::quant::transcriptome::TranscriptomeIndex>,
+    pub transcript3p: Option<Mutex<crate::solo::transcript3p::Transcript3pAcc>>,
 }
 
 /// Per-region read tallies for the `Summary.csv` mapping funnel (uniquely-mapped
@@ -677,6 +683,7 @@ impl SoloContext {
         let feature_reads = features.iter().map(|_| AtomicU64::new(0)).collect();
         let sj_enabled = params.solo_features.iter().any(|f| f == "SJ");
         let velocyto_enabled = params.solo_features.iter().any(|f| f == "Velocyto");
+        let transcript3p = params.solo_features.iter().any(|f| f == "Transcript3p");
         let want_multi = params.solo_multi_mappers.iter().any(|m| m != "Unique");
 
         Ok(Self {
@@ -695,6 +702,20 @@ impl SoloContext {
             velocyto_enabled,
             velocyto_records: Mutex::new(Vec::new()),
             want_multi,
+            transcriptome: transcript3p
+                .then(|| {
+                    crate::quant::transcriptome::TranscriptomeIndex::from_gtf_exons_configured(
+                        &exons,
+                        genome,
+                        &params.sjdb_gtf_tag_exon_parent_transcript,
+                        &params.sjdb_gtf_tag_exon_parent_gene,
+                        &params.sjdb_gtf_tag_exon_parent_gene_name,
+                        &params.sjdb_gtf_tag_exon_parent_gene_type,
+                    )
+                })
+                .transpose()?,
+            transcript3p: transcript3p
+                .then(|| Mutex::new(crate::solo::transcript3p::Transcript3pAcc::new())),
         })
     }
 
@@ -871,6 +892,25 @@ impl SoloContext {
                 fo
             })
             .collect();
+
+        // Transcript3p: every transcript this read is concordant with, and how
+        // far its 3' end sits from each transcript's. Uniquely-mapped reads
+        // only — a read at several genomic loci says nothing about isoforms.
+        if let (Some(acc), Some(tx), Some(cb)) =
+            (&self.transcript3p, &self.transcriptome, cb_resolved)
+            && n_loci == 1
+            && let Some(align) = cdna_transcripts.first()
+        {
+            let hits = crate::solo::transcript3p::concordant_transcripts(
+                align,
+                tx,
+                align.read_length() as u32,
+            );
+            if !hits.is_empty() {
+                acc.lock().unwrap().add(cb, umi, hits);
+            }
+        }
+
         out
     }
 

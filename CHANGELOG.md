@@ -97,6 +97,30 @@ Sections commonly used: Features, Bug fixes, Other changes.
   glibc's malloc and per-thread heaps that return whole segments to
   the OS when abandoned, so allocator cache size stays bounded.
 
+- **`--soloCellFilter EmptyDrops_CR` now uses CellRanger's actual
+  statistics.** The ambient profile is smoothed with Simple Good-Turing,
+  as CellRanger and STAR do, instead of an approximation that reserved
+  unseen mass from the singleton rate and spread the remainder in
+  proportion to raw counts. The Monte-Carlo null is drawn with libc++'s
+  `std::mt19937` and `std::discrete_distribution`, seeded
+  `19760110 * (isim + 1)` per simulation as STAR seeds it, replacing a
+  SplitMix64 stream that could not agree with STAR's over an arbitrary
+  number of draws. Cell calls move as a result.
+
+- **`--soloFeatures Transcript3p`** quantifies transcripts rather than
+  genes, using how far each read's 3' end sits from each transcript's.
+  In a 3'-biased assay that distance discriminates between isoforms: a
+  read 200 bases from the end of one and 4000 from the end of another
+  is evidence for the first. The distance distribution is estimated
+  from the data, then used as the likelihood in an EM over UMIs. Output
+  is per *cluster* rather than per cell — `--soloClusterCBfile` (new,
+  and required for this feature) says which cell is in which cluster,
+  because one cell has too few UMIs to resolve isoforms. Reads sharing
+  a UMI contribute the intersection of their transcript sets, not the
+  union: they came from one molecule. Writes `matrix.mtx`,
+  `features.tsv` and `transcriptEndDistanceDistribution.txt` under
+  `Solo.out/Transcript3p/raw/`.
+
 ### Bug fixes
 
 - **STARsolo `Gene` assignment now requires exon concordance**, matching
