@@ -12,6 +12,7 @@
 pub mod count;
 pub mod gene;
 pub mod libcxx_rng;
+pub mod sgt;
 pub mod smartseq;
 pub mod whitelist;
 
