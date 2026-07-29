@@ -97,6 +97,14 @@ Sections commonly used: Features, Bug fixes, Other changes.
   glibc's malloc and per-thread heaps that return whole segments to
   the OS when abandoned, so allocator cache size stays bounded.
 
+- **`--runMode soloCellFiltering <raw dir> <output prefix>`** cell-calls
+  an existing raw count matrix without aligning anything. Cell calling
+  is a decision about a matrix, not about reads: re-calling with
+  different `--soloCellFilter` parameters should not mean re-aligning,
+  and a matrix produced elsewhere should be callable too. It streams
+  the matrix into the same form the align path produces, so the filters
+  are the identical code rather than a second implementation.
+
 ### Bug fixes
 
 - **STARsolo `Gene` assignment now requires exon concordance**, matching
