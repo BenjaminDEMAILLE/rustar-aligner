@@ -25,10 +25,18 @@ trap 'rm -rf "$WORK"' EXIT
 # cores does not just add noise, it can invert the result, and it is invisible
 # in the numbers afterwards: the series simply drifts. Checking beforehand is
 # the only cheap way to know the measurement means anything.
-load_now() { uptime | sed -E 's/.*load averages?: *([0-9.]+).*/\1/'; }
-LOAD=$(load_now)
-if awk -v l="$LOAD" 'BEGIN{exit !(l > 2.0)}'; then
-  echo "load average is $LOAD; other work is running and the numbers would not mean anything." >&2
+#
+# The check is on CPU idle, not on load average. Load average is an exponential
+# average over minutes, so it stays high long after the offending job has gone
+# and would refuse to measure on a machine that is now perfectly quiet. Idle
+# percentage answers the question actually being asked: are the cores free right
+# now.
+cpu_idle() { # percent idle, sampled over one second
+  top -l 2 -n 0 2>/dev/null | awk '/CPU usage/ {gsub("%","",$(NF-1)); v=$(NF-1)} END {print v+0}'
+}
+IDLE=$(cpu_idle)
+if awk -v i="$IDLE" 'BEGIN{exit !(i < 80)}'; then
+  echo "CPU is only ${IDLE}% idle; other work is running and the numbers would not mean anything." >&2
   echo "wait for the machine to be idle, or set BENCH_IGNORE_LOAD=1 to override." >&2
   [ "${BENCH_IGNORE_LOAD:-0}" = "1" ] || exit 1
 fi
@@ -61,5 +69,5 @@ for i in $(seq 1 "$PAIRS"); do
     b=$(run "$WORK/htslib" "$WORK/h")
     a=$(run "$WORK/noodles" "$WORK/n")
   fi
-  echo "pair$i noodles=${a}s htslib=${b}s load=$(load_now)"
+  echo "pair$i noodles=${a}s htslib=${b}s idle=$(cpu_idle)%"
 done
