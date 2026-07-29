@@ -42,18 +42,6 @@ This is the reason faithfulness is reported **tie-adjusted**. On the 10k yeast b
 
 **Source.** `src/solo/count.rs` (`UmiFiltering::MultiGeneUmiAll`, `filter_multi_gene_umi`), locked by `test_solo_multigene_umi_all_drops_cross_gene_umis`. STAR: `SoloFeature_collapseUMIall.cpp`, `ParametersSolo.cpp`.
 
-### 1.3 Homopolymer UMIs other than poly-A are rejected
-
-**What STAR does.** The UMI validity check rejects a homopolymer by comparing the packed UMI against a precomputed all-same-base value, but the loop that builds those values runs over `umiL`, which is zero at that point for `CB_UMI_Simple`. Only the poly-A case (packed value zero) is caught; poly-C, poly-G and poly-T pass through as valid UMIs.
-
-**What rustar-aligner does.** Rejects every homopolymer UMI.
-
-**Why.** A homopolymer UMI is a sequencing artefact whatever base it repeats; letting three of the four through is not a rule, it is the consequence of reading an uninitialised length.
-
-**Impact.** Removes a small number of artefact UMIs from the counts that STAR keeps.
-
-**Source.** `src/solo/whitelist.rs` (`check_umi`), locked by `umi_valid_rejects_every_homopolymer`. STAR: `SoloReadBarcode_getCBandUMI.cpp` (`umiL`).
-
 ---
 
 ## 2. Cases where rustar-aligner outperforms STAR
