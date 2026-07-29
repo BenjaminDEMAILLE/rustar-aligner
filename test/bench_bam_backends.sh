@@ -21,6 +21,18 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
+# Refuse to measure on a busy machine. A single unrelated job saturating the
+# cores does not just add noise, it can invert the result, and it is invisible
+# in the numbers afterwards: the series simply drifts. Checking beforehand is
+# the only cheap way to know the measurement means anything.
+load_now() { uptime | sed -E 's/.*load averages?: *([0-9.]+).*/\1/'; }
+LOAD=$(load_now)
+if awk -v l="$LOAD" 'BEGIN{exit !(l > 2.0)}'; then
+  echo "load average is $LOAD; other work is running and the numbers would not mean anything." >&2
+  echo "wait for the machine to be idle, or set BENCH_IGNORE_LOAD=1 to override." >&2
+  [ "${BENCH_IGNORE_LOAD:-0}" = "1" ] || exit 1
+fi
+
 echo "building both backends" >&2
 cargo build --release --manifest-path "$ROOT/Cargo.toml" >&2
 cp "$ROOT/target/release/rustar-aligner" "$WORK/noodles"
@@ -49,5 +61,5 @@ for i in $(seq 1 "$PAIRS"); do
     b=$(run "$WORK/htslib" "$WORK/h")
     a=$(run "$WORK/noodles" "$WORK/n")
   fi
-  echo "pair$i noodles=${a}s htslib=${b}s"
+  echo "pair$i noodles=${a}s htslib=${b}s load=$(load_now)"
 done
