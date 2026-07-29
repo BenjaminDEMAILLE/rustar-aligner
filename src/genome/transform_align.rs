@@ -95,7 +95,6 @@ pub fn transform_transcript(
         n_junction,
         junction_motifs: motifs,
         junction_annotated: annotated,
-        read_seq: tr.read_seq.clone(),
     })
 }
 
