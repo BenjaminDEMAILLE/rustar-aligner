@@ -45,10 +45,117 @@ fn bgzf_compression(level: i32) -> bgzf::io::writer::CompressionLevel {
 }
 
 /// Create a BGZF writer with the given STAR compression level.
-fn make_bgzf_writer<W: std::io::Write>(inner: W, compression: i32) -> bgzf::io::Writer<W> {
-    bgzf::io::writer::Builder::default()
+///
+/// Deflate runs on the global rayon pool, which `run()` sizes from
+/// `--runThreadN`, while a dedicated thread writes the finished frames in
+/// order. Block boundaries, frame layout and the EOF marker are the same as
+/// the single-threaded `bgzf::io::Writer`: both stage into a buffer of
+/// `MAX_BUF_SIZE`, both emit through `write_frame`, and libdeflate is
+/// deterministic at a fixed level. The bytes are therefore identical to what
+/// the serial writer produced, which
+/// `multithreaded_bgzf_is_byte_identical_to_the_serial_writer` pins.
+///
+/// **The returned writer must not be written to from a rayon worker thread.**
+/// It hands each finished block to the pool via `rayon::spawn` and blocks on a
+/// channel bounded by the worker count while a dedicated thread drains it. A
+/// caller that is itself occupying a worker can therefore fill the channel and
+/// then wait for a compression task that has no free worker to run on: a real
+/// deadlock, not a slowdown, and it is reachable at any pool size. rustar's
+/// writes come from the pipeline's dispatcher thread (`run_batch_pipeline`
+/// calls `consume` on its own thread, never on the pool), which is why this is
+/// safe here; `write_batch` carries a `debug_assert` so a future call site that
+/// breaks the rule fails loudly in tests instead of hanging in production.
+fn make_bgzf_writer<W: std::io::Write + Send + 'static>(
+    inner: W,
+    compression: i32,
+) -> bgzf::io::MultithreadedWriter<W> {
+    bgzf::io::multithreaded_writer::Builder::default()
         .set_compression_level(bgzf_compression(compression))
         .build_from_writer(inner)
+}
+
+/// Below this many records in a batch, encoding on the calling thread beats
+/// paying for the fan-out.
+const PARALLEL_ENCODE_MIN_RECORDS: usize = 512;
+
+/// Encode records to the raw BAM byte stream: per record, a little-endian
+/// `block_size` followed by the encoded record.
+///
+/// This is what `bam::io::Writer::write_alignment_record` writes, and it is
+/// produced here by that same call against an in-memory writer, so the bytes
+/// cannot drift from the noodles encoder.
+fn encode_records_into(
+    header: &sam::Header,
+    records: &[RecordBuf],
+    out: Vec<u8>,
+) -> Result<Vec<u8>, Error> {
+    let mut writer = bam::io::Writer::from(out);
+    for record in records {
+        writer.write_alignment_record(header, record)?;
+    }
+    Ok(writer.into_inner())
+}
+
+/// How many records the sorted writers encode at a time on `finish()`.
+///
+/// The whole sorted set is already resident as `RecordBuf`s; encoding it in one
+/// pass would hold the entire encoded stream alongside them. Encoding in slices
+/// keeps the extra buffer bounded while still handing the pool enough records
+/// per slice to be worth the fan-out.
+const ENCODE_SLICE_RECORDS: usize = 65_536;
+
+/// Guard the rule documented on `make_bgzf_writer`: writing to the
+/// multithreaded BGZF writer from a rayon worker can deadlock. Cheap enough to
+/// run on every batch, and only in debug builds.
+fn assert_not_on_rayon_worker() {
+    debug_assert!(
+        rayon::current_thread_index().is_none(),
+        "BGZF writes must come from outside the rayon pool: writing from a worker \
+         can block the pool on its own compression tasks and deadlock"
+    );
+}
+
+/// Encode `records` in bounded slices and write each to `writer`.
+fn write_records_chunked<W: Write>(
+    writer: &mut W,
+    header: &sam::Header,
+    records: &[RecordBuf],
+) -> Result<(), Error> {
+    for slice in records.chunks(ENCODE_SLICE_RECORDS) {
+        let bytes = encode_batch(header, slice)?;
+        writer.write_all(&bytes)?;
+    }
+    Ok(())
+}
+
+/// Encode a batch to raw BAM bytes, splitting the work across the rayon pool.
+///
+/// `bam::io::Writer` carries no state between records other than a scratch
+/// buffer it clears at the top of every `write_alignment_record`, so encoding
+/// a sub-range against a fresh in-memory writer yields exactly the bytes that
+/// sub-range would have contributed to the serial stream. Concatenating the
+/// sub-ranges in input order therefore reproduces the serial stream byte for
+/// byte, which is why this is output-neutral rather than merely equivalent.
+fn encode_batch(header: &sam::Header, batch: &[RecordBuf]) -> Result<Vec<u8>, Error> {
+    let threads = rayon::current_num_threads();
+    if threads < 2 || batch.len() < PARALLEL_ENCODE_MIN_RECORDS {
+        return encode_records_into(header, batch, Vec::new());
+    }
+
+    use rayon::prelude::*;
+    let chunk_len = batch.len().div_ceil(threads).max(64);
+    // `par_chunks` is an indexed parallel iterator, so `collect` restores input
+    // order regardless of which worker finished first.
+    let chunks: Vec<Vec<u8>> = batch
+        .par_chunks(chunk_len)
+        .map(|chunk| encode_records_into(header, chunk, Vec::new()))
+        .collect::<Result<_, _>>()?;
+
+    let mut out = Vec::with_capacity(chunks.iter().map(Vec::len).sum());
+    for chunk in &chunks {
+        out.extend_from_slice(chunk);
+    }
+    Ok(out)
 }
 
 /// BAM file writer (streaming, unsorted)
@@ -57,8 +164,9 @@ fn make_bgzf_writer<W: std::io::Write>(inner: W, compression: i32) -> bgzf::io::
 /// without buffering or sorting. The output is BGZF-compressed but unsorted.
 /// Users can sort the output with `samtools sort` if needed.
 pub struct BamWriter {
-    writer: bam::io::Writer<bgzf::io::Writer<BufWriter<File>>>,
+    writer: bgzf::io::MultithreadedWriter<BufWriter<File>>,
     header: sam::Header,
+    finished: bool,
 }
 
 /// BAM file writer that collects all records in memory, sorts by coordinate,
@@ -87,10 +195,13 @@ impl BamWriter {
         compression: i32,
     ) -> Result<Self, Error> {
         let buf_writer = BufWriter::new(File::create(output_path)?);
-        let mut bgzf = make_bgzf_writer(buf_writer, compression);
-        write_bam_header_lenient(&mut bgzf, &header, None)?;
-        let writer = bam::io::Writer::from(bgzf);
-        Ok(Self { writer, header })
+        let mut writer = make_bgzf_writer(buf_writer, compression);
+        write_bam_header_lenient(&mut writer, &header, None)?;
+        Ok(Self {
+            writer,
+            header,
+            finished: false,
+        })
     }
 
     /// Create a new BAM writer with header from genome index.
@@ -127,15 +238,20 @@ impl BamWriter {
     /// # Arguments
     /// * `batch` - Slice of records to write
     pub fn write_batch(&mut self, batch: &[RecordBuf]) -> Result<(), Error> {
-        for record in batch {
-            self.writer.write_alignment_record(&self.header, record)?;
-        }
+        assert_not_on_rayon_worker();
+        let bytes = encode_batch(&self.header, batch)?;
+        self.writer.write_all(&bytes)?;
         Ok(())
     }
 
     /// Flush and close BAM file
     pub fn finish(&mut self) -> Result<(), Error> {
-        self.writer.finish(&self.header)?;
+        // `MultithreadedWriter::finish` shuts the workers down and panics if
+        // called twice; `Drop` calls it too when it has not run yet.
+        if !self.finished {
+            self.writer.finish()?;
+            self.finished = true;
+        }
         log::info!("BAM file written successfully");
         Ok(())
     }
@@ -198,13 +314,10 @@ impl SortedBamWriter {
             });
 
         let buf_writer = BufWriter::new(File::create(&self.output_path)?);
-        let mut bgzf = make_bgzf_writer(buf_writer, self.compression);
-        write_bam_header_lenient(&mut bgzf, &self.header, Some("coordinate"))?;
-        let mut bam_writer = bam::io::Writer::from(bgzf);
-        for record in &self.records {
-            bam_writer.write_alignment_record(&self.header, record)?;
-        }
-        bam_writer.finish(&self.header)?;
+        let mut writer = make_bgzf_writer(buf_writer, self.compression);
+        write_bam_header_lenient(&mut writer, &self.header, Some("coordinate"))?;
+        write_records_chunked(&mut writer, &self.header, &self.records)?;
+        writer.finish()?;
         log::info!("Sorted BAM written ({} records)", self.records.len());
         Ok(())
     }
@@ -218,15 +331,13 @@ impl SortedBamWriter {
                 _ => (usize::MAX, 0),
             });
 
-        let stdout = std::io::stdout();
-        let buf_writer = BufWriter::new(stdout.lock());
-        let mut bgzf = make_bgzf_writer(buf_writer, self.compression);
-        write_bam_header_lenient(&mut bgzf, &self.header, Some("coordinate"))?;
-        let mut bam_writer = bam::io::Writer::from(bgzf);
-        for record in &self.records {
-            bam_writer.write_alignment_record(&self.header, record)?;
-        }
-        bam_writer.finish(&self.header)?;
+        // `std::io::stdout()` rather than a lock guard: the BGZF writer owns
+        // its sink on a worker thread, so the sink has to be `'static`.
+        let buf_writer = BufWriter::new(std::io::stdout());
+        let mut writer = make_bgzf_writer(buf_writer, self.compression);
+        write_bam_header_lenient(&mut writer, &self.header, Some("coordinate"))?;
+        write_records_chunked(&mut writer, &self.header, &self.records)?;
+        writer.finish()?;
         log::info!(
             "Sorted BAM written to stdout ({} records)",
             self.records.len()
@@ -371,31 +482,38 @@ fn render_sam_text_lenient(header: &sam::Header, sort_order: Option<&str>) -> Ve
 
 /// Streaming unsorted BAM writer that writes to stdout.
 pub struct BamStdoutWriter {
-    writer: bam::io::Writer<bgzf::io::Writer<BufWriter<std::io::Stdout>>>,
+    writer: bgzf::io::MultithreadedWriter<BufWriter<std::io::Stdout>>,
     header: sam::Header,
+    finished: bool,
 }
 
 impl BamStdoutWriter {
     pub fn create(genome: &crate::genome::Genome, params: &Parameters) -> Result<Self, Error> {
         let header = crate::io::sam::build_sam_header(genome, params)?;
-        let mut bgzf = make_bgzf_writer(
+        let mut writer = make_bgzf_writer(
             BufWriter::new(std::io::stdout()),
             params.out_bam_compression,
         );
-        write_bam_header_lenient(&mut bgzf, &header, None)?;
-        let writer = bam::io::Writer::from(bgzf);
-        Ok(Self { writer, header })
+        write_bam_header_lenient(&mut writer, &header, None)?;
+        Ok(Self {
+            writer,
+            header,
+            finished: false,
+        })
     }
 
     pub fn write_batch(&mut self, batch: &[RecordBuf]) -> Result<(), Error> {
-        for record in batch {
-            self.writer.write_alignment_record(&self.header, record)?;
-        }
+        assert_not_on_rayon_worker();
+        let bytes = encode_batch(&self.header, batch)?;
+        self.writer.write_all(&bytes)?;
         Ok(())
     }
 
     pub fn finish(&mut self) -> Result<(), Error> {
-        self.writer.finish(&self.header)?;
+        if !self.finished {
+            self.writer.finish()?;
+            self.finished = true;
+        }
         Ok(())
     }
 }
@@ -659,6 +777,156 @@ mod tests {
             writer.is_ok(),
             "BAM writer with compression=0 should succeed"
         );
+    }
+
+    /// The pre-change write path: one serial `bgzf::io::Writer`, records fed
+    /// one at a time through `bam::io::Writer`. Every neutrality test below
+    /// compares against these bytes, so what is being asserted is not "the two
+    /// new halves agree with each other" but "the output did not move".
+    fn serial_reference_bytes(header: &sam::Header, records: &[RecordBuf]) -> Vec<u8> {
+        let mut bgzf = bgzf::io::writer::Builder::default()
+            .set_compression_level(bgzf_compression(1))
+            .build_from_writer(Vec::new());
+        write_bam_header_lenient(&mut bgzf, header, None).unwrap();
+        let mut writer = bam::io::Writer::from(bgzf);
+        for record in records {
+            writer.write_alignment_record(header, record).unwrap();
+        }
+        writer.try_finish().unwrap();
+        writer.into_inner().into_inner()
+    }
+
+    fn unmapped_records(params: &Parameters, n: usize) -> Vec<RecordBuf> {
+        (0..n)
+            .map(|i| {
+                crate::io::sam::SamWriter::build_unmapped_record(
+                    &format!("read{i}"),
+                    &[0, 1, 2, 3, 3, 2, 1, 0],
+                    &[30; 8],
+                    params,
+                    crate::stats::UnmappedReason::Other,
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    /// The multithreaded BGZF writer stages into the same `MAX_BUF_SIZE`
+    /// buffer, emits through the same `write_frame`, and appends the same EOF
+    /// block as the serial writer, so switching to it must not move a byte.
+    /// Enough records to span several BGZF blocks, so block boundaries are
+    /// actually exercised rather than a single short block.
+    #[test]
+    fn multithreaded_bgzf_is_byte_identical_to_the_serial_writer() {
+        let params = default_params();
+        let header = sam::Header::default();
+        let records = unmapped_records(&params, 4000);
+        let expected = serial_reference_bytes(&header, &records);
+
+        let mut writer = make_bgzf_writer(Vec::new(), 1);
+        write_bam_header_lenient(&mut writer, &header, None).unwrap();
+        for record in &records {
+            let bytes =
+                encode_records_into(&header, std::slice::from_ref(record), Vec::new()).unwrap();
+            writer.write_all(&bytes).unwrap();
+        }
+        let got = writer.finish().unwrap();
+
+        assert_eq!(got, expected);
+    }
+
+    /// Splitting the batch across the pool is only sound if concatenating the
+    /// sub-ranges in input order reproduces the serial stream. Checked at
+    /// several pool sizes, including one worker (which takes the serial branch)
+    /// and a size that does not divide the batch evenly.
+    #[test]
+    fn parallel_encoding_is_byte_identical_at_every_worker_count() {
+        let params = default_params();
+        let header = sam::Header::default();
+        let records = unmapped_records(&params, 3000);
+        let expected = encode_records_into(&header, &records, Vec::new()).unwrap();
+
+        for threads in [1, 3, 4, 7, 16] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let got = pool.install(|| encode_batch(&header, &records)).unwrap();
+            assert_eq!(got, expected, "encoding diverged at {threads} workers");
+        }
+    }
+
+    /// Batches under the fan-out threshold take the serial branch; that branch
+    /// has to produce the same bytes as the parallel one, not merely a valid
+    /// stream.
+    #[test]
+    fn a_batch_below_the_fanout_threshold_encodes_the_same_bytes() {
+        let params = default_params();
+        let header = sam::Header::default();
+        let records = unmapped_records(&params, PARALLEL_ENCODE_MIN_RECORDS - 1);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(8)
+            .build()
+            .unwrap();
+        let got = pool.install(|| encode_batch(&header, &records)).unwrap();
+        assert_eq!(
+            got,
+            encode_records_into(&header, &records, Vec::new()).unwrap()
+        );
+    }
+
+    /// The sorted writers encode in bounded slices rather than in one pass, so
+    /// the slice boundary must not show up in the output.
+    #[test]
+    fn chunked_encoding_matches_a_single_pass() {
+        let params = default_params();
+        let header = sam::Header::default();
+        let records = unmapped_records(&params, 2500);
+        let expected = encode_records_into(&header, &records, Vec::new()).unwrap();
+
+        let mut got = Vec::new();
+        for slice in records.chunks(700) {
+            got.extend_from_slice(&encode_batch(&header, slice).unwrap());
+        }
+        assert_eq!(got, expected);
+    }
+
+    /// End to end through `BamWriter`: the file on disk is byte-identical to
+    /// what the serial path wrote.
+    ///
+    /// Deliberately not wrapped in a `ThreadPool::install`. Doing so puts the
+    /// caller on a worker and deadlocks, for the reason spelled out on
+    /// `make_bgzf_writer` — this test found that the hard way. Worker-count
+    /// invariance of the part that has one is covered by
+    /// `parallel_encoding_is_byte_identical_at_every_worker_count`; BGZF block
+    /// boundaries do not depend on the worker count at all, since the staging
+    /// buffer fills to a fixed size before any block is handed to the pool.
+    #[test]
+    fn bam_file_is_byte_identical_to_the_serial_path() {
+        let genome = create_test_genome();
+        let params = default_params();
+        let header = crate::io::sam::build_sam_header(&genome, &params).unwrap();
+        let records = unmapped_records(&params, 2000);
+        let expected = serial_reference_bytes(&header, &records);
+
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut writer = BamWriter::create(temp_file.path(), &genome, &params).unwrap();
+        writer.write_batch(&records).unwrap();
+        writer.finish().unwrap();
+
+        assert_eq!(std::fs::read(temp_file.path()).unwrap(), expected);
+    }
+
+    /// `finish()` shuts the BGZF workers down, and calling it twice would panic
+    /// inside noodles. `Drop` also calls it. Both paths have to stay safe.
+    #[test]
+    fn finishing_twice_is_not_an_error() {
+        let genome = create_test_genome();
+        let params = default_params();
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut writer = BamWriter::create(temp_file.path(), &genome, &params).unwrap();
+        writer.finish().unwrap();
+        writer.finish().unwrap();
     }
 
     #[test]

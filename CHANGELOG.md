@@ -11,6 +11,18 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ## [Unreleased]
 
+### Other changes
+
+- BAM output now compresses and encodes on the rayon pool sized by
+  `--runThreadN`, instead of deflating one BGZF block at a time on the
+  writing thread. Output is unchanged: the multithreaded BGZF writer
+  stages into the same buffer size, emits through the same frame writer
+  and appends the same EOF block, and record encoding is split into
+  sub-ranges whose concatenation in input order is the serial stream.
+  Pinned by `multithreaded_bgzf_is_byte_identical_to_the_serial_writer`,
+  `parallel_encoding_is_byte_identical_at_every_worker_count` and
+  `bam_file_is_byte_identical_to_the_serial_path`.
+
 ### Features
 
 - **STARsolo single-cell quantification (`--soloType`)** — the 10x
