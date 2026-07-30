@@ -131,3 +131,11 @@ Sections commonly used: Features, Bug fixes, Other changes.
   needs random access to the SA in RAM.
 
 Initial release of Rust rewrite of STAR.
+### Other changes
+
+- The splice-motif check in the junction scan carries a sliding window
+  and looks the motif up in a table instead of re-reading four genome
+  bases and matching on them at every position. Output is unchanged
+  (SAM byte-identical on 200k reads); the scan itself goes from 8.5 ns
+  to 5.2 ns per iteration, measured by `examples/jrbench.rs`.
+
