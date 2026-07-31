@@ -1148,6 +1148,29 @@ pub struct Parameters {
           value_parser = ["Whitelist", "Observed"])]
     pub solo_out_raw_barcodes: String,
 
+    /// Shape of the solo matrix output on disk. **Not a STAR parameter**; a
+    /// rustar-aligner addition, default `STARsolo`, which changes nothing.
+    ///
+    /// `CellRanger` lays the same numbers out the way `cellranger count` does,
+    /// so a tool written against CellRanger's `outs/` reads a rustar run
+    /// unmodified. It implies, unless the corresponding flag is given
+    /// explicitly:
+    ///
+    /// * directories `raw_feature_bc_matrix/` and `filtered_feature_bc_matrix/`
+    ///   instead of `raw/` and `filtered/`;
+    /// * a `-1` GEM-well suffix on every barcode;
+    /// * gzip on all three files (`--soloOutGzip yes`);
+    /// * `--soloOutRawBarcodes Observed`, since CellRanger's raw matrix has one
+    ///   column per observed barcode, not one per whitelist entry;
+    /// * the output directory `outs/` instead of `Solo.out/`, with no
+    ///   per-feature subdirectory when exactly one feature is requested.
+    ///
+    /// Counts are untouched. Only where the bytes land, and how the barcodes
+    /// are spelled, changes.
+    #[arg(long = "soloOutLayout", default_value = "STARsolo",
+          value_parser = ["STARsolo", "CellRanger"])]
+    pub solo_out_layout: String,
+
     /// Velocyto ambiguous-molecule handling (rustar extension beyond STARsolo).
     /// `yes` (default) writes the three `spliced`/`unspliced`/`ambiguous` matrices
     /// like STARsolo — exon-only molecules with no junction/intron evidence stay in
@@ -1364,6 +1387,7 @@ impl Parameters {
         let mut params = <Self as clap::FromArgMatches>::from_arg_matches(&matches)?;
 
         apply_cellranger_defaults_on_10x(&mut params, &matches);
+        apply_cellranger_layout(&mut params, &matches);
 
         params.command_line = {
             let args: Vec<_> = args.iter().map(|s| s.to_string_lossy()).collect();
@@ -1889,12 +1913,15 @@ impl Parameters {
 
 /// The flags STAR documents for matching CellRanger 4.x/5.x
 /// (`docs/STARsolo.md`), applied by default when the run is a 10x one.
-const CELLRANGER_DEFAULTS: [(&str, &str); 5] = [
+const CELLRANGER_DEFAULTS: [(&str, &str); 6] = [
     ("clip_adapter_type", "CellRanger4"),
     ("out_filter_score_min", "30"),
     ("solo_cb_match_wl_type", "1MM_multi_Nbase_pseudocounts"),
     ("solo_umi_filtering", "MultiGeneUMI_CR"),
     ("solo_umi_dedup", "1MM_CR"),
+    // Not a STAR flag: the output layout, so a 10x run lands where a tool
+    // written against `cellranger count` expects to find it.
+    ("solo_out_layout", "CellRanger"),
 ];
 
 /// Does this look like a 10x Chromium run?
@@ -1946,6 +1973,7 @@ fn apply_cellranger_defaults_on_10x(params: &mut Parameters, matches: &clap::Arg
             "solo_cb_match_wl_type" => params.solo_cb_match_wl_type = value.to_string(),
             "solo_umi_filtering" => params.solo_umi_filtering = vec![value.to_string()],
             "solo_umi_dedup" => params.solo_umi_dedup = vec![value.to_string()],
+            "solo_out_layout" => params.solo_out_layout = value.to_string(),
             _ => continue,
         }
         applied.push(value);
@@ -1960,6 +1988,34 @@ fn apply_cellranger_defaults_on_10x(params: &mut Parameters, matches: &clap::Arg
             params.solo_umi_len,
             applied.join(", ")
         );
+    }
+}
+
+/// `--soloOutLayout CellRanger` implies three existing flags and the output
+/// directory name. Each is still overridable: a flag named on the command line
+/// keeps its value, so the layout can be adopted piecemeal.
+///
+/// Runs after `apply_cellranger_defaults_on_10x`, so it sees the layout whether
+/// it was asked for or inferred from 10x geometry.
+fn apply_cellranger_layout(params: &mut Parameters, matches: &clap::ArgMatches) {
+    use clap::parser::ValueSource;
+
+    if params.solo_out_layout != "CellRanger" {
+        return;
+    }
+    let given = |id: &str| matches.value_source(id) == Some(ValueSource::CommandLine);
+
+    if !given("solo_out_gzip") {
+        params.solo_out_gzip = "yes".to_string();
+    }
+    if !given("solo_out_raw_barcodes") {
+        params.solo_out_raw_barcodes = "Observed".to_string();
+    }
+    if !given("solo_out_file_names")
+        && let Some(dir) = params.solo_out_file_names.first_mut()
+    {
+        // CellRanger writes its matrices under `outs/`, not `Solo.out/`.
+        *dir = "outs/".to_string();
     }
 }
 
@@ -1997,6 +2053,111 @@ mod tests {
         assert_eq!(p.solo_cb_match_wl_type, "1MM_multi_Nbase_pseudocounts");
         assert_eq!(p.solo_umi_filtering, vec!["MultiGeneUMI_CR".to_string()]);
         assert_eq!(p.solo_umi_dedup, vec!["1MM_CR".to_string()]);
+        assert_eq!(p.solo_out_layout, "CellRanger");
+    }
+
+    /// `--soloOutLayout CellRanger` pulls three existing flags and the output
+    /// directory with it, so the layout is one decision rather than four.
+    #[test]
+    fn cellranger_layout_implies_gzip_observed_barcodes_and_outs_dir() {
+        let p = Parameters::try_parse_from([
+            "rustar-aligner",
+            "--readFilesIn",
+            "cdna.fq",
+            "cb.fq",
+            "--sjdbGTFfile",
+            "genes.gtf",
+            "--soloType",
+            "CB_UMI_Simple",
+            "--soloCBwhitelist",
+            "wl.txt",
+            "--soloCBstart",
+            "1",
+            "--soloCBlen",
+            "12",
+            "--soloUMIstart",
+            "13",
+            "--soloUMIlen",
+            "10",
+            "--soloOutLayout",
+            "CellRanger",
+        ])
+        .unwrap();
+        // 12-base CB, so the 10x autodetection is not what set this.
+        assert_eq!(p.solo_out_layout, "CellRanger");
+        assert_eq!(p.solo_out_gzip, "yes");
+        assert_eq!(p.solo_out_raw_barcodes, "Observed");
+        assert_eq!(p.solo_out_file_names.first().unwrap(), "outs/");
+    }
+
+    /// The layout is adoptable piecemeal: each flag it implies is still
+    /// overridable on the command line.
+    #[test]
+    fn an_explicit_flag_beats_what_the_cellranger_layout_implies() {
+        let p = Parameters::try_parse_from([
+            "rustar-aligner",
+            "--readFilesIn",
+            "cdna.fq",
+            "cb.fq",
+            "--sjdbGTFfile",
+            "genes.gtf",
+            "--soloType",
+            "CB_UMI_Simple",
+            "--soloCBwhitelist",
+            "wl.txt",
+            "--soloCBstart",
+            "1",
+            "--soloCBlen",
+            "16",
+            "--soloUMIstart",
+            "17",
+            "--soloUMIlen",
+            "12",
+            "--soloOutGzip",
+            "no",
+            "--soloOutRawBarcodes",
+            "Whitelist",
+            "--soloOutFileNames",
+            "Solo.out/",
+            "features.tsv",
+            "barcodes.tsv",
+            "matrix.mtx",
+        ])
+        .unwrap();
+        assert_eq!(p.solo_out_layout, "CellRanger");
+        assert_eq!(p.solo_out_gzip, "no");
+        assert_eq!(p.solo_out_raw_barcodes, "Whitelist");
+        assert_eq!(p.solo_out_file_names.first().unwrap(), "Solo.out/");
+    }
+
+    /// The default is STARsolo's layout: no `-1`, no `outs/`, no gzip.
+    #[test]
+    fn non_10x_geometry_keeps_the_starsolo_layout() {
+        let p = Parameters::try_parse_from([
+            "rustar-aligner",
+            "--readFilesIn",
+            "cdna.fq",
+            "cb.fq",
+            "--sjdbGTFfile",
+            "genes.gtf",
+            "--soloType",
+            "CB_UMI_Simple",
+            "--soloCBwhitelist",
+            "wl.txt",
+            "--soloCBstart",
+            "1",
+            "--soloCBlen",
+            "12",
+            "--soloUMIstart",
+            "13",
+            "--soloUMIlen",
+            "10",
+        ])
+        .unwrap();
+        assert_eq!(p.solo_out_layout, "STARsolo");
+        assert_eq!(p.solo_out_gzip, "no");
+        assert_eq!(p.solo_out_raw_barcodes, "Whitelist");
+        assert_eq!(p.solo_out_file_names.first().unwrap(), "Solo.out/");
     }
 
     /// A flag given on the command line always wins, including when the value
