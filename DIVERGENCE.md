@@ -216,6 +216,44 @@ rather than taken from its source.
 
 ---
 
+### 3.5 `--soloCellFilter OrdMag`, and EmptyDrops_CR's initial cell set (non-STAR)
+
+**What STAR does.** STARsolo's cell calling is `CellRanger2.2`: take the
+`quantile` of the top `nExpectedCells` barcodes by UMI count and call every
+barcode holding at least that over `maxMinRatio`, with `nExpectedCells` fixed
+at 3 000. `EmptyDrops_CR` uses the same knee for the set of cells it guarantees
+before the Monte-Carlo rescue.
+
+**What CellRanger does.** The same rule, but it *searches* for the expected
+cell count instead of assuming one: it minimises `(OrdMag(x) - x)^2 / x` over
+`x` from 2 to about 45 000, where `OrdMag(x)` is the number of cells the rule
+calls when told to expect `x`. The loss is small where the rule predicts
+itself. EmptyDrops then rescues barcodes below that cutoff.
+
+**What rustar-aligner does.** `--soloCellFilter OrdMag maxExpectedCells
+quantile ratio` (default `45000 0.99 10`) implements the search, and
+`EmptyDrops_CR` now uses it for its initial set, which is the order CellRanger
+runs the two steps in. `CellRanger2.2` is untouched and remains the default.
+
+**Two things the 10x page does not specify, decided here.** Every integer in
+range is evaluated rather than a geometric grid, so the result is the true
+minimum of the stated loss rather than a nearby grid point; each evaluation is
+a binary search over the sorted totals, so an exhaustive sweep costs nothing
+measurable. And ties go to the smaller `x`, so the result does not depend on
+iteration order — determinism, as everywhere else in this codebase.
+
+**Impact.** `EmptyDrops_CR`'s initial cell set can differ from what it was.
+On the 20 000-read fixture it does not: `CellRanger2.2`, `OrdMag` and
+`EmptyDrops_CR` all call 200 cells, as does CellRanger 10.0.0. That fixture has
+a clean plateau, where any of these rules works; the two rules part company on
+a graded distribution with no plateau, which is what the unit tests cover.
+
+**Source.** `src/solo/count.rs` (`ordmag_at`, `ordmag_threshold`). CellRanger:
+the Gene Expression algorithm page, "Cell Calling", read rather than taken from
+its source. Coverage of the rest of that page is tracked in #181.
+
+---
+
 ## 4. Implementation divergences (no intended output difference)
 
 These differ in *how* a result is produced, not *what* is produced. They are documented so a reviewer chasing a discrepancy knows the mechanism differs by design.

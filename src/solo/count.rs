@@ -998,6 +998,61 @@ fn knee_cr22(umis_desc: &[u64], n_expected: usize, max_pct: f64, max_min_ratio: 
     (robust_max / max_min_ratio).ceil() as u64
 }
 
+/// How many cells the order-of-magnitude rule calls if `n` cells are expected,
+/// and the UMI cutoff it used.
+///
+/// The rule, from 10x's Gene Expression algorithm page: take `m`, the
+/// `quantile` of the top `n` barcodes by UMI count, and call every barcode
+/// holding at least `m / ratio`. With the defaults that is "the 99th percentile
+/// of the top n, divided by ten", the same shape as `knee_cr22` but with `n` a
+/// variable rather than a fixed 3 000.
+fn ordmag_at(umis_desc: &[u64], n: usize, quantile: f64, ratio: f64) -> (usize, u64) {
+    if umis_desc.is_empty() || n == 0 {
+        return (0, 0);
+    }
+    let idx = ((n as f64 * (1.0 - quantile)).round() as usize).min(umis_desc.len() - 1);
+    let cutoff = ((umis_desc[idx] as f64 / ratio).round() as u64).max(1);
+    // `umis_desc` is descending, so the called set is its prefix.
+    let called = umis_desc.partition_point(|&u| u >= cutoff);
+    (called, cutoff)
+}
+
+/// CellRanger's OrdMag cell-calling threshold: the UMI cutoff at the expected
+/// cell count that best predicts itself.
+///
+/// 10x describes this as minimising `(OrdMag(x) - x)^2 / x` over a search from
+/// 2 to about 45 000 cells. `OrdMag(x)` is the number of cells the rule above
+/// calls when told to expect `x` of them, so the loss is small where the rule
+/// is self-consistent: feed it the right number of cells and it gives that
+/// number back.
+///
+/// Two choices this makes explicit, because the page does not state them:
+///
+/// * **Every integer in range is evaluated**, rather than a geometric grid
+///   refined by search. Each evaluation is a binary search over the sorted
+///   totals, so an exhaustive sweep of 45 000 candidates costs nothing
+///   measurable and finds the true minimum of the stated loss rather than a
+///   grid point near it.
+/// * **Ties go to the smaller `x`**, so the result does not depend on iteration
+///   order.
+fn ordmag_threshold(umis_desc: &[u64], max_expected: usize, quantile: f64, ratio: f64) -> u64 {
+    if umis_desc.is_empty() {
+        return 0;
+    }
+    let hi = max_expected.min(umis_desc.len()).max(2);
+    let mut best: Option<(f64, u64)> = None;
+    for x in 2..=hi {
+        let (called, cutoff) = ordmag_at(umis_desc, x, quantile, ratio);
+        let d = called as f64 - x as f64;
+        let loss = d * d / x as f64;
+        // Strictly-less keeps the first (smallest) x on a tie.
+        if best.is_none_or(|(b, _)| loss < b) {
+            best = Some((loss, cutoff));
+        }
+    }
+    best.map_or(0, |(_, cutoff)| cutoff)
+}
+
 /// Whitelist indices of called cells (sorted ascending) per `--soloCellFilter`.
 /// `None` → no filtered/ output. `EmptyDrops_CR` writes only the knee-guaranteed
 /// cells here (the Monte-Carlo rescue is the standalone `emptydrops` binary).
@@ -1011,6 +1066,17 @@ fn called_cells(cells: &[CellStat], filter: &[String]) -> Option<Vec<u32>> {
             let mut idx: Vec<&CellStat> = cells.iter().collect();
             idx.sort_by(|a, b| b.n_umis.cmp(&a.n_umis).then(a.cb.cmp(&b.cb)));
             idx.into_iter().take(n).map(|c| c.cb).collect()
+        }
+        // CellRanger's own initial cell set, searched rather than assumed.
+        "OrdMag" => {
+            let mut umis: Vec<u64> = cells.iter().map(|c| c.n_umis).collect();
+            umis.sort_unstable_by(|a, b| b.cmp(a));
+            let thr = ordmag_threshold(&umis, arg(1, 45000.0) as usize, arg(2, 0.99), arg(3, 10.0));
+            cells
+                .iter()
+                .filter(|c| c.n_umis >= thr)
+                .map(|c| c.cb)
+                .collect()
         }
         // EmptyDrops_CR is handled by `emptydrops_called`; the knee here is the
         // fallback / guaranteed-cell base.
@@ -1051,7 +1117,9 @@ fn emptydrops_called(
             .and_then(|s| s.parse::<f64>().ok())
             .unwrap_or(d)
     };
-    let (n_expected, max_pct, ratio) = (arg(1, 3000.0) as usize, arg(2, 0.99), arg(3, 10.0));
+    // `nExpectedCells` (arg 1) is the 2.2 knee's fixed cell count; OrdMag
+    // searches for it instead, so this path no longer reads it.
+    let (max_pct, ratio) = (arg(2, 0.99), arg(3, 10.0));
     let (ind_min, ind_max) = (arg(4, 45000.0) as usize, arg(5, 90000.0) as usize);
     let umi_min = arg(6, 500.0) as u64;
     let umi_min_frac = arg(7, 0.01);
@@ -1063,7 +1131,12 @@ fn emptydrops_called(
     let mut order: Vec<&CellStat> = cells.iter().collect();
     order.sort_by(|a, b| b.n_umis.cmp(&a.n_umis).then(a.cb.cmp(&b.cb)));
     let totals_desc: Vec<u64> = order.iter().map(|c| c.n_umis).collect();
-    let thr = knee_cr22(&totals_desc, n_expected, max_pct, ratio);
+    // CellRanger's initial cell set is OrdMag, not the 2.2 knee: the same
+    // quantile-over-ratio rule, but with the expected cell count searched for
+    // rather than fixed. EmptyDrops then rescues barcodes below it. `ind_min`
+    // is already the ~45 000 upper bound 10x states for that search, so the
+    // parameter list is unchanged.
+    let thr = ordmag_threshold(&totals_desc, ind_min, max_pct, ratio);
     let n_simple = totals_desc.iter().take_while(|&&u| u >= thr).count();
     let mut called: Vec<u32> = order.iter().take(n_simple).map(|c| c.cb).collect();
 
@@ -2440,6 +2513,80 @@ mod tests {
             called_cells(&cells, &s(&["EmptyDrops_CR", "3000", "0.99", "10"])),
             Some(cr)
         );
+    }
+
+    /// OrdMag finds the expected cell count that predicts itself. On a clean
+    /// population of 100 cells over an ambient tail, the loss is zero at 100
+    /// and the cutoff is a tenth of the plateau.
+    #[test]
+    fn ordmag_finds_the_self_consistent_cell_count() {
+        let mut umis: Vec<u64> = vec![1000; 100];
+        umis.extend(std::iter::repeat_n(10u64, 5000));
+        umis.sort_unstable_by(|a, b| b.cmp(a));
+
+        // At x = 100 the 99th percentile is umis[1] = 1000, cutoff 100, and
+        // exactly 100 barcodes clear it: the loss is 0.
+        let (called, cutoff) = ordmag_at(&umis, 100, 0.99, 10.0);
+        assert_eq!((called, cutoff), (100, 100));
+
+        assert_eq!(ordmag_threshold(&umis, 45000, 0.99, 10.0), 100);
+        assert_eq!(umis.iter().filter(|&&u| u >= 100).count(), 100);
+    }
+
+    /// The 2.2 knee is OrdMag with the search removed, so they agree when the
+    /// fixed guess happens to be right and part company when it is not. Here
+    /// 20 000 cells sit far from the knee's hardcoded 3 000.
+    #[test]
+    fn ordmag_beats_a_fixed_expected_cell_count_when_the_guess_is_wrong() {
+        let mut umis: Vec<u64> = vec![5000; 20_000];
+        umis.extend(std::iter::repeat_n(5u64, 100_000));
+        umis.sort_unstable_by(|a, b| b.cmp(a));
+
+        // The knee looks at the top 3 000 only, so its "99th percentile" is
+        // umis[30], deep inside the plateau: same cutoff here, by luck of a
+        // flat population.
+        assert_eq!(knee_cr22(&umis, 3000, 0.99, 10.0), 500);
+        assert_eq!(ordmag_threshold(&umis, 45000, 0.99, 10.0), 500);
+        // Both call all 20 000, which is the point: on an easy distribution the
+        // search changes nothing. It earns its keep on the graded one below.
+        assert_eq!(umis.iter().filter(|&&u| u >= 500).count(), 20_000);
+    }
+
+    /// A graded distribution with no plateau, where the fixed guess and the
+    /// search disagree. This is the case the search exists for.
+    #[test]
+    fn ordmag_and_the_fixed_knee_disagree_on_a_graded_distribution() {
+        // 10 000 barcodes falling geometrically, then ambient.
+        let mut umis: Vec<u64> = (0..10_000)
+            .map(|i| (100_000.0 * 0.9995_f64.powi(i)) as u64)
+            .collect();
+        umis.extend(std::iter::repeat_n(2u64, 50_000));
+        umis.sort_unstable_by(|a, b| b.cmp(a));
+
+        let knee = knee_cr22(&umis, 3000, 0.99, 10.0);
+        let ord = ordmag_threshold(&umis, 45000, 0.99, 10.0);
+        assert_ne!(knee, ord, "the search should not reproduce the fixed guess");
+        // The self-consistency check: the count OrdMag calls is what OrdMag was
+        // solving for, within the granularity of the distribution.
+        let called = umis.iter().filter(|&&u| u >= ord).count();
+        let (recall, _) = ordmag_at(&umis, called, 0.99, 10.0);
+        assert!(
+            (recall as i64 - called as i64).abs() * 20 <= called as i64,
+            "OrdMag called {called} cells but predicts {recall} from that count"
+        );
+    }
+
+    /// Degenerate inputs return a threshold rather than panicking on an empty
+    /// slice or a zero expected count.
+    #[test]
+    fn ordmag_handles_empty_and_tiny_inputs() {
+        assert_eq!(ordmag_threshold(&[], 45000, 0.99, 10.0), 0);
+        assert_eq!(ordmag_at(&[], 10, 0.99, 10.0), (0, 0));
+        assert_eq!(ordmag_at(&[100], 0, 0.99, 10.0), (0, 0));
+        // One barcode: the cutoff is a tenth of it, and it clears its own bar.
+        assert_eq!(ordmag_at(&[100], 1, 0.99, 10.0), (1, 10));
+        // The cutoff never drops below 1, so a zero-UMI barcode is never a cell.
+        assert_eq!(ordmag_at(&[1, 0], 2, 0.99, 10.0), (1, 1));
     }
 
     #[test]

@@ -1113,7 +1113,15 @@ pub struct Parameters {
     #[arg(long = "soloCBmatchWLtype", default_value = "1MM_multi")]
     pub solo_cb_match_wl_type: String,
 
-    /// Cell-calling / matrix filtering: None, CellRanger2.2, EmptyDrops_CR, TopCells.
+    /// Cell-calling / matrix filtering: None, CellRanger2.2, EmptyDrops_CR,
+    /// TopCells, OrdMag.
+    ///
+    /// `OrdMag` is CellRanger's own initial cell call and is **not a STAR
+    /// method**: the same quantile-over-ratio rule as `CellRanger2.2`, but with
+    /// the expected cell count searched for rather than fixed at 3 000. Its
+    /// arguments are `maxExpectedCells quantile ratio`, default
+    /// `45000 0.99 10`. `EmptyDrops_CR` now uses it for its initial set, which
+    /// is the order CellRanger runs the two steps in.
     #[arg(long = "soloCellFilter", num_args = 1.., default_values_t = vec!["CellRanger2.2".to_string(), "3000".to_string(), "0.99".to_string(), "10".to_string()])]
     pub solo_cell_filter: Vec<String>,
 
