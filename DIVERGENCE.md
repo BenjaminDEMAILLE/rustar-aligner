@@ -110,6 +110,34 @@ On the 10k yeast PE benchmark, 4 reads differ in alignment score (AS) because ST
 **Impact.** Past libc++'s load factor the map rehashes, and the order then depends on the bucket count, which depends on how many distinct barcodes were seen; beyond that size the order diverges. The **values never do** — only which line they appear on. Reading the file by barcode rather than by position is unaffected either way.
 
 **Source.** `src/solo/cell_reads.rs`, locked by `rows_are_emitted_in_reverse_first_appearance_order`. STAR: `SoloFeature_statsOutput.cpp`.
+### 1.3 CellRanger behaviour is the default on 10x geometry
+
+**What STAR does.** STARsolo's defaults are its own (`1MM_multi`,
+`1MM_All`, no UMI filtering, `Hamming` clipping, `outFilterScoreMin 0`)
+whatever the barcode geometry. Matching CellRanger requires passing five flags,
+listed in STAR's `docs/STARsolo.md`.
+
+**What rustar-aligner does.** When the run is unambiguously 10x —
+`CB_UMI_Simple`, a whitelist, a 16-base CB and a 10- or 12-base UMI — those
+five flags default to their CellRanger values. Any flag given on the command
+line wins, and the substitution is logged in full.
+
+**Why.** A user aligning 10x data and comparing against CellRanger otherwise
+gets a successful run and different numbers, with nothing pointing at the five
+flags that explain it. Measured against CellRanger 10.0.0 on a 20 000-read
+fixture, those flags move the count matrix from 8.9% away to 0.03%.
+
+**Impact.** This is a **change of default output behaviour** and therefore the
+largest divergence in this file. It is confined to a geometry nothing else in
+common use shares, it is escapable by naming any flag explicitly, and it is
+announced at `INFO` on every run it touches. It needs maintainer sign-off.
+
+**Source.** `src/params/mod.rs` (`looks_like_10x`,
+`apply_cellranger_defaults_on_10x`). STAR: `docs/STARsolo.md`, "Matching
+CellRanger 4.x and 5.x results".
+
+---
+
 ### 3.2 `--soloOutRawBarcodes Observed` (opt-in, non-STAR)
 
 **What STAR does.** STARsolo's raw matrix has one column per whitelist
