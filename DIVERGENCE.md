@@ -126,8 +126,9 @@ line wins, and the substitution is logged in full.
 gets a successful run and different numbers, with nothing pointing at the five
 flags that explain it. Measured against CellRanger 10.0.0 on a 20 000-read
 fixture, those flags move the count matrix from 8.96% above CellRanger to
-2.17% above it. The remaining 2.17% is an open divergence: STAR 2.7.11b with
-the same flags is at +0.09%, so this closes most of the gap and not all of it.
+0.03% above it, once #165's `cbMinP` posterior threshold is also applied.
+STAR 2.7.11b with the same flags is at +0.09%, so all three agree to within a
+fraction of a percent.
 
 **Impact.** This is a **change of default output behaviour** and therefore the
 largest divergence in this file. It is confined to a geometry nothing else in
