@@ -1614,7 +1614,12 @@ pub fn write_gene_matrix(
                 invalid_umis,
                 mapped_unique,
                 mapped_multi,
-                reads_of(crate::solo::SoloFeature::Gene),
+                // "Confidently mapped to transcriptome" is the reads this
+                // feature assigned to exactly one gene. Reading it off `Gene`
+                // unconditionally reports 0.0% on a `--soloFeatures GeneFull`
+                // run, where no `Gene` feature exists — a metric silently
+                // reporting zero is worse than one that is absent.
+                reads_of(*feature),
                 r,
             )?;
             log::info!(
