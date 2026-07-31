@@ -191,8 +191,16 @@ denominators:
 * `Valid UMI Sequences` is measured over reads that reached the UMI check, i.e.
   those with a valid barcode.
 * `Sequencing Saturation` is `1 - molecules / reads` over the reads that
-  entered the matrix. This is the largest disagreement on the fixture: 12.8%
-  against CellRanger's 7.4%.
+  entered the matrix. This is the largest disagreement on the fixture: 12.7%
+  against CellRanger's 7.4%. 10x define it as
+  `1 - n_deduped_reads / n_reads`, with `n_deduped_reads` the number of unique
+  `(barcode, UMI, gene)` combinations among confidently mapped reads. Taking
+  that literally — counting distinct triples *before* UMI correction — gives
+  **0.0%** on this fixture, because no two reads here share an exact triple, so
+  the literal reading is ruled out and their numerator is the corrected
+  molecule count, as ours is. The residual is therefore the denominator: at
+  7.4% theirs implies about 16 300 reads where ours counts about 17 300. The
+  difference is which reads are "confidently mapped", not the formula.
 * `Mean Reads per Cell` is total reads over called cells, not reads-in-cells
   over called cells, which is what reproduces CellRanger's value.
 
