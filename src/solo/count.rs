@@ -2562,6 +2562,9 @@ mod tests {
     /// on a 20 000-read 10x fixture it removed nothing at all, against 1 030
     /// counts removed by STAR.
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> abfcf3e (fix(solo): MultiGeneUMI_CR decides ownership on corrected UMIs)
     /// STAR's second condition: the winner on *corrected* UMIs must also not
     /// be beaten on *uncorrected* ones at the same key
     /// (`SoloFeature_collapseUMIall.cpp:226-232`). Correction can move reads
@@ -2590,8 +2593,11 @@ mod tests {
         );
     }
 
+<<<<<<< HEAD
 =======
 >>>>>>> 51304b5 (fix(solo): MultiGeneUMI_CR gives a tied UMI to nobody, not to everybody)
+=======
+>>>>>>> abfcf3e (fix(solo): MultiGeneUMI_CR decides ownership on corrected UMIs)
     #[test]
     fn multi_gene_umi_cr_drops_a_tie_entirely() {
         let mut tied = HashMap::default();
