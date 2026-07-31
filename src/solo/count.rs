@@ -2539,7 +2539,6 @@ mod tests {
             "at most one molecule per corrected UMI, got {counts:?}"
         );
     }
-
     #[test]
     fn multi_gene_umi_cr_drops_a_tie_entirely() {
         let mut tied = HashMap::default();
