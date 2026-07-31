@@ -80,7 +80,9 @@ line wins, and the substitution is logged in full.
 **Why.** A user aligning 10x data and comparing against CellRanger otherwise
 gets a successful run and different numbers, with nothing pointing at the five
 flags that explain it. Measured against CellRanger 10.0.0 on a 20 000-read
-fixture, those flags move the count matrix from 8.9% away to 0.03%.
+fixture, those flags move the count matrix from 8.96% above CellRanger to
+2.17% above it. The remaining 2.17% is an open divergence: STAR 2.7.11b with
+the same flags is at +0.09%, so this closes most of the gap and not all of it.
 
 **Impact.** This is a **change of default output behaviour** and therefore the
 largest divergence in this file. It is confined to a geometry nothing else in
