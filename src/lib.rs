@@ -1356,7 +1356,6 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
     tr_writer: Option<&mut crate::io::bam::BamWriter>,
     unmapped_writer: Option<&mut crate::io::fastq::UnmappedFastqWriter>,
 ) -> anyhow::Result<()> {
-    use crate::align::read_align::align_read;
     use crate::io::fastq::{FastqReader, clip_read};
     use crate::io::sam::{BufferedSamRecords, SamWriter};
     use crate::params::OutFilterType;
@@ -1728,10 +1727,39 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                 // Adapter-aware clip params (fixed 5'/3' Nbases + 3' adapter Hamming
                 // scan); built once per batch, applied per read via clip_mate.
                 let clip_params = crate::clip::clip_params_from(params, 0);
+                // Clip first, then find every read's seeds with their
+                // suffix-array searches interleaved (P3: `find_seeds_batch`).
+                // A chain's next search cannot start until the current one
+                // finishes, but chains from different reads are independent, so
+                // running SEED_BATCH_WIDTH of them in lockstep turns that many
+                // dependent DRAM stalls into overlapping ones. The seeds are
+                // identical to the per-read search, in the same order; only the
+                // memory access pattern differs.
+                let clipped: Vec<(usize, usize, Vec<u8>, Vec<u8>)> = batch
+                    .par_iter()
+                    .map(|read| {
+                        let (c5, c3) = crate::clip::clip_mate(&read.sequence, &clip_params);
+                        let (seq, qual) = clip_read(&read.sequence, &read.quality, c5, c3);
+                        (c5, c3, seq, qual)
+                    })
+                    .collect();
+                let seed_lists: Vec<Vec<crate::align::seed::Seed>> = clipped
+                    .par_chunks(crate::align::seed::SEED_BATCH_WIDTH)
+                    .flat_map(|chunk| {
+                        let refs: Vec<&[u8]> = chunk.iter().map(|c| c.2.as_slice()).collect();
+                        crate::align::seed::Seed::find_seeds_batch(
+                            &refs,
+                            &index,
+                            params.seed_map_min,
+                            params,
+                        )
+                    })
+                    .collect();
                 batch
                     .par_iter()
                     .enumerate()
-                    .map(|(read_idx, read)| {
+                    .zip(seed_lists)
+                    .map(|((read_idx, read), read_seeds)| {
                         // --outSAMreadID Number: replace the output QNAME with the
                         // read's 1-based input index (deterministic — from the FASTQ
                         // order via `base`, not parallel execution order). The seed
@@ -1750,10 +1778,11 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                         let sj_stats = Arc::clone(&sj_stats);
                         let quant = quant.as_ref().map(Arc::clone);
 
-                        // Apply clipping: fixed Nbases + 3' adapter (clip_mate), then trim.
-                        let (clip5p, clip3p) = crate::clip::clip_mate(&read.sequence, &clip_params);
-                        let (clipped_seq, clipped_qual) =
-                            clip_read(&read.sequence, &read.quality, clip5p, clip3p);
+                        // Clipping was done above, with the batched seed search.
+                        let (clip5p, clip3p, clipped_seq, clipped_qual) = {
+                            let c = &clipped[read_idx];
+                            (c.0, c.1, c.2.clone(), c.3.clone())
+                        };
 
                         let mut buffer = BufferedSamRecords::new();
                         let mut chimeric_alns = Vec::new();
@@ -1804,7 +1833,13 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
 
                         // Align read (CPU-intensive, pure function)
                         let (transcripts, chimeric_results, n_for_mapq, unmapped_reason) =
-                            align_read(&clipped_seq, &read.name, &index, params)?;
+                            crate::align::read_align::align_read_with_seeds(
+                                &clipped_seq,
+                                &read.name,
+                                &index,
+                                params,
+                                read_seeds,
+                            )?;
 
                         // Collect chimeric alignments if enabled
                         if params.chim_segment_min > 0 {

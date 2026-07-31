@@ -163,16 +163,30 @@ pub fn align_read(
     params: &Parameters,
 ) -> Result<AlignReadResult, Error> {
     let debug_read = !params.read_name_filter.is_empty() && read_name == params.read_name_filter;
-
-    // Step 1: Find seeds (seedMapMin from params)
-    let min_seed_length = params.seed_map_min;
     let seeds = Seed::find_seeds(
         read_seq,
         index,
-        min_seed_length,
+        params.seed_map_min,
         params,
         if debug_read { read_name } else { "" },
     )?;
+    align_read_with_seeds(read_seq, read_name, index, params, seeds)
+}
+
+/// [`align_read`] with the seed search already done.
+///
+/// Splitting it out lets a caller find the seeds for a whole chunk of reads at
+/// once (`Seed::find_seeds_batch`), which overlaps their suffix-array stalls;
+/// everything after the seeds is per-read work and unchanged.
+#[allow(clippy::needless_pass_by_value)] // the caller moves its list in
+pub fn align_read_with_seeds(
+    read_seq: &[u8],
+    read_name: &str,
+    index: &GenomeIndex,
+    params: &Parameters,
+    seeds: Vec<crate::align::seed::Seed>,
+) -> Result<AlignReadResult, Error> {
+    let debug_read = !params.read_name_filter.is_empty() && read_name == params.read_name_filter;
 
     if debug_read {
         let total_positions: usize = seeds.iter().map(|s| s.sa_end - s.sa_start).sum();

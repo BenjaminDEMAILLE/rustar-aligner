@@ -102,25 +102,162 @@ impl Seed {
         // Match STAR: sort by (rStart asc, Length desc) — a *stable* sort so that
         // among equal (rStart, Length) the earliest-found seed (forward, since
         // L→R is collected first) is kept — then dedup direction-agnostically.
-        seeds.sort_by(|a, b| {
-            a.read_pos
-                .cmp(&b.read_pos)
-                .then_with(|| b.length.cmp(&a.length))
-        });
-        {
-            // STAR storeAligns dedup: drop exact (rStart, Length) duplicates
-            // regardless of search direction (main #5 / #112 — direction-agnostic
-            // key). Integer-keyed via FxHash + pre-sized for speed (PR #90 perf:
-            // default SipHash + growth-rehash showed up in profiling).
-            let mut seen: rustc_hash::FxHashSet<(usize, usize)> =
-                rustc_hash::FxHashSet::with_capacity_and_hasher(
-                    seeds.len(),
-                    rustc_hash::FxBuildHasher,
-                );
-            seeds.retain(|s| seen.insert((s.read_pos, s.length)));
+        Ok(finalize_seed_order(seeds))
+    }
+
+    /// Find seeds for several reads at once, with their suffix-array searches
+    /// interleaved.
+    ///
+    /// Same seeds as calling [`find_seeds`](Self::find_seeds) on each read, in
+    /// the same order: the chains are driven in lockstep rather than one after
+    /// another, and each chain's seeds are collected into its own bucket so the
+    /// concatenation reproduces the sequential push order exactly. The
+    /// `seedPerReadNmax` cap is then applied by truncation, which is what the
+    /// sequential early return amounts to.
+    ///
+    /// Batching pays because a chain's next search cannot start until the
+    /// current one finishes, but *different* chains -- across starting
+    /// positions, across directions, and across reads -- are independent. There
+    /// are only a handful of chains within one read, well under the width where
+    /// the interleave pays for itself, which is why this takes a slice of reads
+    /// rather than working inside one.
+    pub fn find_seeds_batch(
+        reads: &[&[u8]],
+        index: &GenomeIndex,
+        min_seed_length: usize,
+        params: &Parameters,
+    ) -> Vec<Vec<Seed>> {
+        // One cursor per (read, direction, starting position). `bucket` is the
+        // cursor's slot in the final concatenation, so seed order does not
+        // depend on the order chains happen to finish.
+        struct Cursor {
+            read_idx: usize,
+            bucket: usize,
+            is_rc: bool,
+            pos: usize,
+            original_read_len: usize,
+            done: bool,
         }
 
-        Ok(seeds)
+        let rc_reads: Vec<Vec<u8>> = reads.iter().map(|r| reverse_complement_read(r)).collect();
+        let mut cursors: Vec<Cursor> = Vec::new();
+        let mut buckets: Vec<Vec<Seed>> = Vec::new();
+        // Per read, the range of bucket indices in sequential order.
+        let mut read_buckets: Vec<Vec<usize>> = vec![Vec::new(); reads.len()];
+
+        for (read_idx, read) in reads.iter().enumerate() {
+            for is_rc in [false, true] {
+                let seq: &[u8] = if is_rc { &rc_reads[read_idx] } else { read };
+                for start_pos in chain_starts(seq.len(), params) {
+                    let bucket = buckets.len();
+                    buckets.push(Vec::new());
+                    read_buckets[read_idx].push(bucket);
+                    cursors.push(Cursor {
+                        read_idx,
+                        bucket,
+                        is_rc,
+                        pos: start_pos,
+                        original_read_len: read.len(),
+                        done: false,
+                    });
+                }
+            }
+        }
+
+        let mut reqs: Vec<MmpReq> = Vec::with_capacity(SEED_BATCH_WIDTH);
+        let mut owners: Vec<usize> = Vec::with_capacity(SEED_BATCH_WIDTH);
+        let mut results: Vec<(usize, usize, usize)> = Vec::new();
+
+        loop {
+            reqs.clear();
+            owners.clear();
+            // One round: every live cursor contributes at most one search.
+            for (ci, c) in cursors.iter_mut().enumerate() {
+                if c.done {
+                    continue;
+                }
+                let seq: &[u8] = if c.is_rc {
+                    &rc_reads[c.read_idx]
+                } else {
+                    reads[c.read_idx]
+                };
+                if c.pos >= seq.len() || seq.len() - c.pos < min_seed_length {
+                    c.done = true;
+                    continue;
+                }
+                let (prepared, sa_start, sa_end, l_initial) =
+                    prepare_seed_at_position(seq, c.pos, index, min_seed_length, false, params);
+                match prepared {
+                    PreparedSeed::Resolved(r) => {
+                        push_seed(
+                            &mut buckets[c.bucket],
+                            r.seed,
+                            c.is_rc,
+                            c.original_read_len,
+                            params,
+                        );
+                        c.pos += r.advance;
+                    }
+                    PreparedSeed::Search { req_read_pos } => {
+                        reqs.push(MmpReq {
+                            read_seq: seq,
+                            read_pos: req_read_pos,
+                            sa_start,
+                            sa_end,
+                            l_initial,
+                        });
+                        owners.push(ci);
+                    }
+                }
+            }
+            if reqs.is_empty() {
+                if cursors.iter().all(|c| c.done) {
+                    break;
+                }
+                continue;
+            }
+            for chunk_start in (0..reqs.len()).step_by(SEED_BATCH_WIDTH) {
+                let chunk = &reqs[chunk_start..(chunk_start + SEED_BATCH_WIDTH).min(reqs.len())];
+                max_mappable_length_batch(chunk, index, &mut results);
+                for (k, &(match_length, ns, ne)) in results.iter().enumerate() {
+                    let c = &mut cursors[owners[chunk_start + k]];
+                    let r = finish_seed(
+                        chunk[k].read_pos,
+                        match_length,
+                        ns,
+                        ne,
+                        min_seed_length,
+                        false,
+                        params,
+                    );
+                    push_seed(
+                        &mut buckets[c.bucket],
+                        r.seed,
+                        c.is_rc,
+                        c.original_read_len,
+                        params,
+                    );
+                    c.pos += r.advance;
+                }
+            }
+        }
+
+        // Concatenate each read's buckets in sequential order, apply the
+        // per-read cap, then the same sort and dedup `find_seeds` applies.
+        read_buckets
+            .into_iter()
+            .map(|bs| {
+                let mut seeds: Vec<Seed> = Vec::new();
+                for b in bs {
+                    if seeds.len() >= params.seed_per_read_nmax {
+                        break;
+                    }
+                    seeds.extend(std::mem::take(&mut buckets[b]));
+                }
+                seeds.truncate(params.seed_per_read_nmax);
+                finalize_seed_order(seeds)
+            })
+            .collect()
     }
 
     /// Find all seeds for paired-end reads using unified seed pooling.
@@ -229,6 +366,65 @@ struct MmpResult {
 ///
 /// Used for R→L direction (is_rc=true). L→R uses dense every-position search.
 #[allow(clippy::too_many_arguments)]
+/// The chain starting positions STAR uses for one direction of one read
+/// (`ReadAlign_mapOneRead.cpp`: `Nstart`, `Lstart`).
+///
+/// Shared by the sequential and batched paths so the two cannot pick different
+/// chains.
+fn chain_starts(read_len: usize, params: &Parameters) -> Vec<usize> {
+    let effective_start_lmax = if read_len > 0 {
+        let over_lread_limit =
+            (params.seed_search_start_lmax_over_lread * (read_len as f64 - 1.0)) as usize;
+        params.seed_search_start_lmax.min(over_lread_limit)
+    } else {
+        params.seed_search_start_lmax
+    };
+    let nstart = if effective_start_lmax > 0 && effective_start_lmax < read_len {
+        read_len / effective_start_lmax + 1
+    } else {
+        1
+    };
+    let lstart = read_len / nstart;
+    (0..nstart).map(|i| (i * lstart).min(read_len)).collect()
+}
+
+/// Store one found seed the way `search_direction_sparse` stores it: apply the
+/// `seedSearchLmax` cap, tag the direction, and convert an RC hit's read
+/// position back to original coordinates.
+fn push_seed(
+    out: &mut Vec<Seed>,
+    seed: Option<Seed>,
+    is_rc: bool,
+    original_read_len: usize,
+    params: &Parameters,
+) {
+    let Some(mut seed) = seed else { return };
+    if params.seed_search_lmax > 0 && seed.length > params.seed_search_lmax {
+        seed.length = params.seed_search_lmax;
+    }
+    seed.search_rc = is_rc;
+    if is_rc {
+        seed.read_pos = original_read_len - seed.read_pos - seed.length;
+    }
+    out.push(seed);
+}
+
+/// STAR's `storeAligns` ordering: sort by (rStart asc, Length desc), stably so
+/// the earliest-found seed wins a tie, then drop exact (rStart, Length)
+/// duplicates regardless of search direction.
+fn finalize_seed_order(mut seeds: Vec<Seed>) -> Vec<Seed> {
+    seeds.sort_by(|a, b| {
+        a.read_pos
+            .cmp(&b.read_pos)
+            .then_with(|| b.length.cmp(&a.length))
+    });
+    let mut seen: rustc_hash::FxHashSet<(usize, usize)> =
+        rustc_hash::FxHashSet::with_capacity_and_hasher(seeds.len(), rustc_hash::FxBuildHasher);
+    seeds.retain(|s| seen.insert((s.read_pos, s.length)));
+    seeds
+}
+
+#[allow(clippy::too_many_arguments)]
 fn search_direction_sparse(
     read_seq: &[u8],
     original_read_len: usize,
@@ -329,101 +525,34 @@ fn search_direction_sparse(
 /// tracking, even when no seed is stored. This matches STAR's behavior where
 /// `maxMappableLength2strands()` always returns the MMP length, and `Lmapped += L`
 /// always advances — regardless of whether the seed passes filters.
-fn find_seed_at_position(
-    read_seq: &[u8],
+/// What the `SAindex` prefix jump concluded for one position.
+///
+/// The jump answers many positions outright -- an `N` first base, an absent
+/// k-mer, or STAR's short-circuit when a shorter prefix already has tight
+/// bounds. Only the rest need the suffix-array binary search, and only those
+/// are worth batching. Splitting the two is what lets a caller collect the
+/// searches of several *independent* reads and run them together.
+enum PreparedSeed {
+    /// Already answered: no suffix-array search needed.
+    Resolved(MmpResult),
+    /// Needs the search. Run it, then hand the result to [`finish_seed`].
+    Search { req_read_pos: usize },
+}
+
+/// The part of `find_seed_at_position` that runs *after* the suffix-array
+/// search: the `seedMultimapNmax` filter and the seed itself.
+///
+/// Shared by the sequential and batched paths so the two cannot drift.
+fn finish_seed(
     read_pos: usize,
-    index: &GenomeIndex,
+    match_length: usize,
+    narrowed_start: usize,
+    narrowed_end: usize,
     min_seed_length: usize,
     is_reverse: bool,
     params: &Parameters,
 ) -> MmpResult {
-    if read_pos >= read_seq.len() {
-        return MmpResult {
-            seed: None,
-            advance: 1,
-        };
-    }
-
-    // Extract k-mer for SAindex lookup
-    let sa_nbases = index.sa_index.nbases as usize;
-    let remaining = read_seq.len() - read_pos;
-
-    if remaining < min_seed_length {
-        return MmpResult {
-            seed: None,
-            advance: 1,
-        };
-    }
-
-    // Build k-mer for SAindex lookup, stopping at first N base
-    let lookup_len = remaining.min(sa_nbases);
-    let mut kmer_idx = 0u64;
-    let mut actual_len = 0usize;
-
-    for i in 0..lookup_len {
-        let base = read_seq[read_pos + i];
-        if base >= 4 {
-            break; // N base — stop building k-mer
-        }
-        kmer_idx = (kmer_idx << 2) | (base as u64);
-        actual_len = i + 1;
-    }
-
-    if actual_len == 0 {
-        return MmpResult {
-            seed: None,
-            advance: 1,
-        }; // First base is N
-    }
-
-    // Hierarchical SAindex lookup (STAR's maxMappableLength2strands approach).
-    // Starts at full k-mer level and progressively shortens until a present
-    // entry is found. This lets us find seeds even when the full k-mer is
-    // absent (e.g., short exon straddling a splice junction).
-    let n_sa = index.suffix_array.len();
-    let result = index
-        .sa_index
-        .hierarchical_lookup(kmer_idx, actual_len as u32, n_sa);
-
-    let Some((sa_start, sa_end, matched_level, bounds_tight)) = result else {
-        return MmpResult {
-            seed: None,
-            advance: 1,
-        };
-    };
-
-    if sa_start >= sa_end {
-        return MmpResult {
-            seed: None,
-            advance: 1,
-        };
-    }
-
-    // STAR short-circuit (maxMappableLength2strands.cpp):
-    // "if (Lind < gSAindexNbases && iSA1noN && iSA2good) { maxL=Lind; }"
-    // When the hierarchical lookup falls back to a prefix shorter than the full
-    // SAindex depth AND bounds are tight, STAR skips the binary search and uses
-    // matched_level directly as the MMP. This causes chains to advance by shorter
-    // amounts, ensuring intermediate positions (missed if advancing by the true MMP)
-    // are not skipped.
-    let (match_length, narrowed_start, narrowed_end) = if bounds_tight && matched_level < sa_nbases
-    {
-        // STAR short-circuit (maxMappableLength2strands.cpp):
-        // "if (Lind < gSAindexNbases && iSA1noN && iSA2good) { maxL=Lind; }"
-        // Very short prefix already found in SAindex; no genome comparison needed.
-        (matched_level, sa_start, sa_end)
-    } else {
-        // Find maximum mappable prefix length and narrow SA range (STAR's maxMappableLength).
-        // When bounds are tight (both from present SAindex entries), we can skip
-        // comparing the first matched_level bases since all entries share that prefix.
-        let l_initial = if bounds_tight { matched_level } else { 0 };
-        max_mappable_length(read_seq, read_pos, index, sa_start, sa_end, l_initial)
-    };
     let advance = match_length.max(1);
-
-    // Check seedMultimapNmax: filter seeds that map to too many loci
-    // Key fix: still advance by MMP length even when seed is not stored
-    // Uses narrowed range (accurate loci count, not overestimated k-mer range)
     let n_loci = narrowed_end - narrowed_start;
     if n_loci > params.seed_multimap_nmax {
         return MmpResult {
@@ -431,7 +560,6 @@ fn find_seed_at_position(
             advance,
         };
     }
-
     if match_length >= min_seed_length {
         MmpResult {
             seed: Some(Seed {
@@ -441,7 +569,7 @@ fn find_seed_at_position(
                 sa_end: narrowed_end,
                 is_reverse,
                 search_rc: false,
-                mate_id: 2, // Single-end default
+                mate_id: 2,
             }),
             advance,
         }
@@ -449,6 +577,134 @@ fn find_seed_at_position(
         MmpResult {
             seed: None,
             advance,
+        }
+    }
+}
+
+/// The part of `find_seed_at_position` that runs *before* the suffix-array
+/// search: the `SAindex` prefix jump and its short-circuits.
+///
+/// Returns the search to run, plus the SA range and starting offset it needs.
+fn prepare_seed_at_position(
+    read_seq: &[u8],
+    read_pos: usize,
+    index: &GenomeIndex,
+    min_seed_length: usize,
+    is_reverse: bool,
+    params: &Parameters,
+) -> (PreparedSeed, usize, usize, usize) {
+    let no_seed = |advance| {
+        (
+            PreparedSeed::Resolved(MmpResult {
+                seed: None,
+                advance,
+            }),
+            0,
+            0,
+            0,
+        )
+    };
+    if read_pos >= read_seq.len() {
+        return no_seed(1);
+    }
+    let sa_nbases = index.sa_index.nbases as usize;
+    let remaining = read_seq.len() - read_pos;
+    if remaining < min_seed_length {
+        return no_seed(1);
+    }
+    let lookup_len = remaining.min(sa_nbases);
+    let mut kmer_idx = 0u64;
+    let mut actual_len = 0usize;
+    for i in 0..lookup_len {
+        let base = read_seq[read_pos + i];
+        if base >= 4 {
+            break;
+        }
+        kmer_idx = (kmer_idx << 2) | (base as u64);
+        actual_len = i + 1;
+    }
+    if actual_len == 0 {
+        return no_seed(1);
+    }
+    let n_sa = index.suffix_array.len();
+    let Some((sa_start, sa_end, matched_level, bounds_tight)) =
+        index
+            .sa_index
+            .hierarchical_lookup(kmer_idx, actual_len as u32, n_sa)
+    else {
+        return no_seed(1);
+    };
+    if sa_start >= sa_end {
+        return no_seed(1);
+    }
+    if bounds_tight && matched_level < sa_nbases {
+        // STAR's short-circuit: a shorter prefix with tight bounds is the MMP,
+        // no genome comparison needed.
+        return (
+            PreparedSeed::Resolved(finish_seed(
+                read_pos,
+                matched_level,
+                sa_start,
+                sa_end,
+                min_seed_length,
+                is_reverse,
+                params,
+            )),
+            0,
+            0,
+            0,
+        );
+    }
+    let l_initial = if bounds_tight { matched_level } else { 0 };
+    (
+        PreparedSeed::Search {
+            req_read_pos: read_pos,
+        },
+        sa_start,
+        sa_end,
+        l_initial,
+    )
+}
+
+/// Find a seed starting at a specific position in the read.
+///
+/// Returns an MmpResult that always provides the MMP advance length for Lmapped
+/// tracking, even when no seed is stored. This matches STAR's behavior where
+/// `maxMappableLength2strands()` always returns the MMP length, and `Lmapped += L`
+/// always advances — regardless of whether the seed passes filters.
+///
+/// The sequential counterpart of the batched path: same `prepare`, same
+/// `finish`, only the search between them differs.
+fn find_seed_at_position(
+    read_seq: &[u8],
+    read_pos: usize,
+    index: &GenomeIndex,
+    min_seed_length: usize,
+    is_reverse: bool,
+    params: &Parameters,
+) -> MmpResult {
+    let (prepared, sa_start, sa_end, l_initial) = prepare_seed_at_position(
+        read_seq,
+        read_pos,
+        index,
+        min_seed_length,
+        is_reverse,
+        params,
+    );
+    match prepared {
+        PreparedSeed::Resolved(r) => r,
+        PreparedSeed::Search { req_read_pos } => {
+            let (match_length, narrowed_start, narrowed_end) =
+                max_mappable_length(read_seq, req_read_pos, index, sa_start, sa_end, l_initial);
+            finish_seed(
+                req_read_pos,
+                match_length,
+                narrowed_start,
+                narrowed_end,
+                min_seed_length,
+                is_reverse,
+                params,
+            )
         }
     }
 }
@@ -473,6 +729,22 @@ fn compare_seq_to_genome(
     l_start: usize,
 ) -> (usize, bool) {
     let sa_entry = index.suffix_array.get(sa_idx);
+    compare_seq_to_genome_raw(read_seq, read_pos, index, sa_entry, l_start)
+}
+
+/// [`compare_seq_to_genome`] with the suffix-array entry already read.
+///
+/// Split out so a batched driver can read (and prefetch) the entry for several
+/// *independent* searches before any of them compares, which is the whole point
+/// of [`max_mappable_length_batch`]. The comparison itself is unchanged, so the
+/// two paths cannot diverge.
+fn compare_seq_to_genome_raw(
+    read_seq: &[u8],
+    read_pos: usize,
+    index: &GenomeIndex,
+    sa_entry: u64,
+    l_start: usize,
+) -> (usize, bool) {
     let (genome_pos, is_reverse) = index.suffix_array.decode(sa_entry);
 
     let genome_start = if is_reverse {
@@ -550,6 +822,300 @@ fn compare_seq_to_genome(
 /// all positions matching the maximum length.
 /// Returns (match_length, narrowed_sa_start, narrowed_sa_end_exclusive).
 /// Ports STAR's maxMappableLength (SuffixArrayFuns.cpp).
+/// How many independent MMP searches [`max_mappable_length_batch`] advances
+/// together.
+///
+/// Each search stalls on a random suffix-array read and then on a random genome
+/// read; running N of them in lockstep turns N dependent stalls into N
+/// overlapping ones. The donor measured 2.09x at 32 and a *regression* at 8, so
+/// the width is not a free parameter: too narrow and the extra bookkeeping
+/// costs more than the overlap saves.
+pub const SEED_BATCH_WIDTH: usize = 32;
+
+/// Where a batched MMP search has got to. Mirrors [`max_mappable_length`]'s
+/// straight-line phases so it can be suspended at each probe -- the point where
+/// it would otherwise stall on DRAM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    /// Needs the `compare(i1)` that opens the function.
+    Init1,
+    /// Needs the `compare(i2)`.
+    Init2,
+    /// Inside `while i1 + 1 < i2`, needs `compare(i3)`.
+    Loop,
+    Done,
+}
+
+/// One search's live state: [`max_mappable_length`]'s locals, made explicit.
+///
+/// The arithmetic and the order of updates below are deliberately identical to
+/// the sequential function; only the control flow is turned inside out.
+struct MmpState<'a> {
+    read_seq: &'a [u8],
+    read_pos: usize,
+    remaining: usize,
+    i1: usize,
+    i2: usize,
+    l: usize,
+    l1: usize,
+    l2: usize,
+    l1a: usize,
+    l1b: usize,
+    i1a: usize,
+    i1b: usize,
+    l2a: usize,
+    l2b: usize,
+    i2a: usize,
+    i2b: usize,
+    i3: usize,
+    l3: usize,
+    phase: Phase,
+    /// The suffix-array index this search wants probed next, or `None` once done.
+    want: Option<usize>,
+    /// The suffix-array entry the driver pre-read for `want`, consumed by the
+    /// comparison.
+    raw: u64,
+    out: Option<(usize, usize, usize)>,
+}
+
+/// One independent search for [`max_mappable_length_batch`]: the arguments
+/// [`max_mappable_length`] takes, bundled so a batch of them can be advanced
+/// together.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MmpReq<'a> {
+    pub read_seq: &'a [u8],
+    pub read_pos: usize,
+    pub sa_start: usize,
+    pub sa_end: usize,
+    pub l_initial: usize,
+}
+
+impl<'a> MmpState<'a> {
+    fn new(r: &MmpReq<'a>) -> Self {
+        MmpState {
+            read_seq: r.read_seq,
+            read_pos: r.read_pos,
+            remaining: r.read_seq.len() - r.read_pos,
+            i1: r.sa_start,
+            i2: r.sa_end - 1,
+            l: r.l_initial,
+            l1: 0,
+            l2: 0,
+            l1a: 0,
+            l1b: 0,
+            i1a: 0,
+            i1b: 0,
+            l2a: 0,
+            l2b: 0,
+            i2a: 0,
+            i2b: 0,
+            i3: r.sa_start,
+            l3: 0,
+            phase: Phase::Init1,
+            want: Some(r.sa_start),
+            raw: 0,
+            out: None,
+        }
+    }
+}
+
+/// Run several *independent* [`max_mappable_length`] searches with their memory
+/// accesses interleaved, returning each one's `(match_len, narrowed_start,
+/// narrowed_end)` in request order.
+///
+/// The loop has three passes per round, and the split is the whole point:
+/// issue every live search's suffix-array prefetch first, then read those
+/// entries and prefetch each search's *dependent* genome byte, then compare.
+/// One search alone would serialise those two misses; N of them overlap.
+///
+/// `find_mult_range` is left sequential, as in the donor: it is a second binary
+/// search with its own probe pattern, and keeping it out makes the equivalence
+/// with the sequential function easy to see. Batching it is the obvious
+/// follow-up if a measurement justifies it.
+pub(crate) fn max_mappable_length_batch(
+    reqs: &[MmpReq<'_>],
+    index: &GenomeIndex,
+    out: &mut Vec<(usize, usize, usize)>,
+) {
+    out.clear();
+    if reqs.is_empty() {
+        return;
+    }
+
+    let mut st: Vec<MmpState> = Vec::with_capacity(reqs.len());
+    for r in reqs {
+        // The single-element case never enters the state machine, exactly as
+        // the sequential function short-circuits it.
+        if r.sa_start + 1 >= r.sa_end {
+            let (l, _) =
+                compare_seq_to_genome(r.read_seq, r.read_pos, index, r.sa_start, r.l_initial);
+            let mut s = MmpState::new(r);
+            s.phase = Phase::Done;
+            s.want = None;
+            s.out = Some((l, r.sa_start, r.sa_start + 1));
+            st.push(s);
+        } else {
+            st.push(MmpState::new(r));
+        }
+    }
+
+    loop {
+        let mut any = false;
+        // Pass A: issue every live search's suffix-array probe, so N line-fills
+        // go out together instead of one per DRAM round-trip.
+        for s in &st {
+            if let Some(isa) = s.want {
+                index.suffix_array.prefetch(isa);
+                any = true;
+            }
+        }
+        if !any {
+            break;
+        }
+        // Pass B: consume the SA entries (their lines are arriving) and
+        // prefetch each search's dependent genome byte -- the second, and
+        // costlier, miss in the chain.
+        for s in &mut st {
+            if let Some(isa) = s.want {
+                s.raw = index.suffix_array.get(isa);
+                let (genome_pos, is_reverse) = index.suffix_array.decode(s.raw);
+                if !is_reverse {
+                    let pos = genome_pos as usize + s.l;
+                    let g = index.genome.sequence.as_slice();
+                    if pos < g.len() {
+                        // SAFETY: `pos` is in bounds of `g` (just checked), and a
+                        // prefetch reads nothing.
+                        crate::cpu::prefetch_read(unsafe { g.as_ptr().add(pos) });
+                    }
+                }
+            }
+        }
+        // Pass C: compare (the genome lines are now hot) and advance each state.
+        for s in &mut st {
+            if s.want.is_some() {
+                let (ml, cr) = compare_seq_to_genome_raw(s.read_seq, s.read_pos, index, s.raw, s.l);
+                mmp_advance(s, index, ml, cr);
+            }
+        }
+    }
+
+    out.extend(st.iter().map(|s| s.out.expect("every search reaches Done")));
+}
+
+/// Drive one [`MmpState`] forward by one probe result. This is
+/// [`max_mappable_length`]'s control flow with the straight line broken into
+/// phases so a batch can suspend a search at each probe.
+fn mmp_advance(s: &mut MmpState, index: &GenomeIndex, ml: usize, comp_res: bool) {
+    match s.phase {
+        Phase::Init1 => {
+            s.l1 = ml;
+            s.phase = Phase::Init2;
+            s.want = Some(s.i2);
+        }
+        Phase::Init2 => {
+            s.l2 = ml;
+            s.l = s.l1.min(s.l2);
+            s.l3 = s.l;
+            s.i3 = s.i1;
+            s.i1a = s.i1;
+            s.l1a = s.l1;
+            s.i1b = s.i1;
+            s.l1b = s.l1;
+            s.i2a = s.i2;
+            s.l2a = s.l2;
+            s.i2b = s.i2;
+            s.l2b = s.l2;
+            s.phase = Phase::Loop;
+            mmp_step_loop(s, index);
+        }
+        Phase::Loop => {
+            s.l3 = ml;
+            if s.l3 == s.remaining {
+                mmp_finish(s, index);
+                return;
+            }
+            if comp_res {
+                if s.l3 > s.l1 {
+                    s.i1a = s.i1b;
+                    s.l1a = s.l1b;
+                    s.i1b = s.i1;
+                    s.l1b = s.l1;
+                }
+                s.i1 = s.i3;
+                s.l1 = s.l3;
+            } else {
+                if s.l3 > s.l2 {
+                    s.i2a = s.i2b;
+                    s.l2a = s.l2b;
+                    s.i2b = s.i2;
+                    s.l2b = s.l2;
+                }
+                s.i2 = s.i3;
+                s.l2 = s.l3;
+            }
+            s.l = s.l1.min(s.l2);
+            mmp_step_loop(s, index);
+        }
+        Phase::Done => unreachable!("advanced a finished search"),
+    }
+}
+
+/// The `while i1 + 1 < i2` test: either request the next midpoint probe, or fall
+/// through to the tail.
+fn mmp_step_loop(s: &mut MmpState, index: &GenomeIndex) {
+    if s.i1 + 1 < s.i2 {
+        s.i3 = median_uint2(s.i1, s.i2);
+        s.want = Some(s.i3);
+    } else {
+        mmp_finish(s, index);
+    }
+}
+
+/// The tail of [`max_mappable_length`]: pick the best match length, then narrow
+/// the range with the two (sequential) `find_mult_range` calls.
+fn mmp_finish(s: &mut MmpState, index: &GenomeIndex) {
+    if s.l3 < s.remaining {
+        if s.l1 > s.l2 {
+            s.l3 = s.l1;
+            s.i3 = s.i1;
+        } else {
+            s.l3 = s.l2;
+            s.i3 = s.i2;
+        }
+    }
+    let narrowed_start = find_mult_range(
+        s.read_seq,
+        s.read_pos,
+        index,
+        s.remaining,
+        s.i3,
+        s.l3,
+        s.i1,
+        s.l1,
+        s.i1a,
+        s.l1a,
+        s.i1b,
+        s.l1b,
+    );
+    let narrowed_end = find_mult_range(
+        s.read_seq,
+        s.read_pos,
+        index,
+        s.remaining,
+        s.i3,
+        s.l3,
+        s.i2,
+        s.l2,
+        s.i2a,
+        s.l2a,
+        s.i2b,
+        s.l2b,
+    );
+    s.out = Some((s.l3, narrowed_start, narrowed_end + 1));
+    s.phase = Phase::Done;
+    s.want = None;
+}
+
 fn max_mappable_length(
     read_seq: &[u8],
     read_pos: usize,
@@ -770,6 +1336,168 @@ mod tests {
         let mut full_args = vec!["rustar-aligner", "--readFilesIn", "reads.fq"];
         full_args.extend_from_slice(args);
         Parameters::parse_from(full_args)
+    }
+
+    /// The batched seed finder must return exactly what calling the sequential
+    /// one per read returns -- same seeds, same order, per read.
+    ///
+    /// Order matters as much as content: `cluster_seeds` creates windows in
+    /// seed order, and the earliest window wins the primary tie-break, so a
+    /// reordering here would change which alignment is reported primary
+    /// without changing any seed.
+    #[test]
+    fn batched_seed_finding_matches_per_read_sequential_calls() {
+        let index = make_test_index(
+            "ACGTACGTAAGGTTCCACGTACGTTTGGCCAAACGTACGTAGGCCTTAACGTACGTGGTTAACCACGTACGT\
+             TTTTGGGGCCCCAAAAACGTACGTATATATATCGCGCGCGACGTACGTTACGTACGACGTACGTGCATGCAT",
+        );
+        let p = params(&["--seedSearchStartLmax", "10"]);
+        let reads: Vec<Vec<u8>> = [
+            "ACGTACGTAAGGTTCCACGTACGT",
+            "TTTTGGGGCCCCAAAAACGTACGT",
+            "GCATGCATACGTACGTTACGTACG",
+            "ACGTACGTATATATATCGCGCGCG",
+            "NNNNACGTACGTAAGGTTCC",
+            "ACGT",
+        ]
+        .iter()
+        .map(|r| encode_sequence(r))
+        .collect();
+        let refs: Vec<&[u8]> = reads.iter().map(Vec::as_slice).collect();
+
+        let sequential: Vec<Vec<Seed>> = refs
+            .iter()
+            .map(|r| Seed::find_seeds(r, &index, 5, &p, "").unwrap())
+            .collect();
+        let batched = Seed::find_seeds_batch(&refs, &index, 5, &p);
+
+        assert_eq!(batched.len(), sequential.len());
+        for (i, (b, q)) in batched.iter().zip(sequential.iter()).enumerate() {
+            assert_eq!(
+                b.len(),
+                q.len(),
+                "read {i}: seed count, batched {b:?} vs sequential {q:?}"
+            );
+            for (j, (bs, qs)) in b.iter().zip(q.iter()).enumerate() {
+                assert_eq!(
+                    (bs.read_pos, bs.length, bs.sa_start, bs.sa_end, bs.search_rc),
+                    (qs.read_pos, qs.length, qs.sa_start, qs.sa_end, qs.search_rc),
+                    "read {i} seed {j}"
+                );
+            }
+        }
+    }
+
+    /// A batch of one, and an empty batch, are the shapes a chunked call site
+    /// hits at the end of every read batch.
+    #[test]
+    fn batched_seed_finding_handles_degenerate_batches() {
+        let index = make_test_index("ACGTACGTTTGGCCAAACGTACGT");
+        let p = params(&[]);
+        let read = encode_sequence("ACGTACGTTTGGCCAA");
+
+        assert!(Seed::find_seeds_batch(&[], &index, 5, &p).is_empty());
+
+        let one = Seed::find_seeds_batch(&[&read], &index, 5, &p);
+        let seq = Seed::find_seeds(&read, &index, 5, &p, "").unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].len(), seq.len());
+    }
+
+    /// The batched search must return exactly what the sequential one returns,
+    /// at every batch width, for every start position of every read.
+    ///
+    /// This is the acceptance criterion for the whole batching change: the
+    /// state machine is `max_mappable_length` turned inside out, so any
+    /// divergence is a transcription bug and would show up as a different seed,
+    /// a different alignment, and a different output file.
+    #[test]
+    fn batched_mmp_search_matches_the_sequential_one_at_every_width() {
+        let index = make_test_index(
+            "ACGTACGTAAGGTTCCACGTACGTTTGGCCAAACGTACGTAGGCCTTAACGTACGTGGTTAACCACGTACGT\
+             TTTTGGGGCCCCAAAAACGTACGTATATATATCGCGCGCGACGTACGTTACGTACGACGTACGTGCATGCAT",
+        );
+        let reads: Vec<Vec<u8>> = [
+            "ACGTACGTAAGGTTCC",
+            "ACGTACGT",
+            "TTTTGGGGCCCCAAAA",
+            "GCATGCAT",
+            "ACGTACGTATATATAT",
+            "NNNNACGTACGT",
+            "A",
+        ]
+        .iter()
+        .map(|r| encode_sequence(r))
+        .collect();
+
+        // Every (read, start) pair that has a live SA range, prepared the way
+        // `find_seed_at_position` prepares them.
+        let mut reqs: Vec<MmpReq> = Vec::new();
+        for read in &reads {
+            for pos in 0..read.len() {
+                reqs.push(MmpReq {
+                    read_seq: read,
+                    read_pos: pos,
+                    sa_start: 0,
+                    sa_end: index.suffix_array.len(),
+                    l_initial: 0,
+                });
+            }
+        }
+        assert!(reqs.len() > 20, "the fixture should exercise many searches");
+
+        let sequential: Vec<(usize, usize, usize)> = reqs
+            .iter()
+            .map(|r| {
+                max_mappable_length(
+                    r.read_seq,
+                    r.read_pos,
+                    &index,
+                    r.sa_start,
+                    r.sa_end,
+                    r.l_initial,
+                )
+            })
+            .collect();
+
+        // Width 1 is the degenerate batch; 128 is wider than the request list,
+        // so the last chunk is short. Both are the shapes most likely to break.
+        for width in [1usize, 2, 8, 32, 128] {
+            let mut got: Vec<(usize, usize, usize)> = Vec::new();
+            let mut out = Vec::new();
+            for chunk in reqs.chunks(width) {
+                max_mappable_length_batch(chunk, &index, &mut out);
+                assert_eq!(out.len(), chunk.len(), "width {width}: result count");
+                got.extend_from_slice(&out);
+            }
+            assert_eq!(got, sequential, "batched != sequential at width {width}");
+        }
+    }
+
+    /// A single-element SA range never enters the state machine; the batch must
+    /// still answer it, and answer it the same way.
+    #[test]
+    fn batched_mmp_handles_single_element_ranges_and_empty_batches() {
+        let index = make_test_index("ACGTACGTTTGGCCAA");
+        let read = encode_sequence("ACGTACGT");
+
+        let mut out = Vec::new();
+        max_mappable_length_batch(&[], &index, &mut out);
+        assert!(out.is_empty(), "an empty batch produces no results");
+
+        let req = MmpReq {
+            read_seq: &read,
+            read_pos: 0,
+            sa_start: 3,
+            sa_end: 4,
+            l_initial: 0,
+        };
+        max_mappable_length_batch(std::slice::from_ref(&req), &index, &mut out);
+        assert_eq!(
+            out[0],
+            max_mappable_length(&read, 0, &index, 3, 4, 0),
+            "single-element range"
+        );
     }
 
     #[test]
