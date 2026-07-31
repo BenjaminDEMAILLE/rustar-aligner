@@ -44,6 +44,13 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 - Read names are cut at `--readNameSeparator` (default `/`), as STAR does. A
   read named `foo/1` was previously emitted as `foo/1` where STAR emits `foo`.
+- `--soloCellFilter OrdMag` implements CellRanger's cell call: the same
+  quantile-over-ratio rule as `CellRanger2.2`, but searching for the expected
+  cell count by minimising `(OrdMag(x) - x)^2 / x` instead of fixing it at
+  3 000. `EmptyDrops_CR` now uses it for its initial cell set, which is the
+  order CellRanger runs the two steps in; `CellRanger2.2` is unchanged and
+  remains the default. See `DIVERGENCE.md` §3.5.
+
 - Under `--soloOutLayout CellRanger`, `metrics_summary.csv` is written with
   CellRanger 10.0.0's 20 metrics, in its order and value formats. STARsolo's
   `Summary.csv` is unchanged and still written alongside. Twelve of the 20
