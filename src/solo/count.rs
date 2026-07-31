@@ -517,6 +517,176 @@ fn observed_barcodes(body: &tempfile::NamedTempFile) -> Result<Vec<u32>, Error> 
     Ok(seen.into_iter().collect())
 }
 
+/// The barcode strings for a set of whitelist indices, with the layout's
+/// suffix, in the same order as the matrix columns.
+///
+/// The MEX writers stream these straight to disk; the HDF5 writer needs them in
+/// memory because a fixed-width dataset has to know its widest value first.
+fn barcode_strings(whitelist: &CbWhitelist, cbs: &[u32], suffix: &str) -> Vec<String> {
+    let mut line: Vec<u8> = Vec::with_capacity(whitelist.barcode_len() + suffix.len());
+    cbs.iter()
+        .map(|&cb| {
+            line.clear();
+            whitelist.unpack_barcode_into(cb, &mut line);
+            let mut s = String::from_utf8_lossy(&line).into_owned();
+            s.push_str(suffix);
+            s
+        })
+        .collect()
+}
+
+/// Write CellRanger's `*_feature_bc_matrix.h5` beside the MEX directory.
+///
+/// Same numbers, same column set, in the HDF5 layout `scanpy.read_10x_h5`,
+/// Seurat's `Read10X_h5` and CellBender read: a `/matrix` group holding the CSC
+/// triplet (`data`, `indices`, `indptr`, `shape`), the barcodes, and a
+/// `/matrix/features` group. Written through `crate::io::hdf5`, an in-tree
+/// writer, so this costs no dependency (see `DIVERGENCE.md` §3.5).
+///
+/// CellRanger's matrix is genes × cells stored column-major, one column per
+/// barcode. The streamed body is already in that order — ascending cell, then
+/// ascending gene within a cell — so the column pointers are built in one pass
+/// rather than by sorting `nnz` entries in memory. That ordering is a property
+/// of `build_matrix_body`, so it is checked here rather than assumed.
+#[allow(clippy::too_many_arguments)]
+fn write_matrix_h5(
+    body: &tempfile::NamedTempFile,
+    out_path: &Path,
+    n_genes: usize,
+    barcodes: &[String],
+    gene_ids: &[String],
+    gene_names: &[String],
+    genome: &str,
+    remap: Option<&HashMap<u32, u32>>,
+) -> Result<(), Error> {
+    use crate::io::hdf5::{AttrValue, Data, GroupSpec};
+
+    let mut data: Vec<i32> = Vec::new();
+    let mut indices: Vec<i64> = Vec::new();
+    // indptr[c] = index into data/indices where column c starts.
+    let mut indptr: Vec<i64> = vec![0; 1];
+
+    let reader =
+        BufReader::new(std::fs::File::open(body.path()).map_err(|e| Error::io(e, body.path()))?);
+    let mut current_col: u32 = 0;
+    for line in reader.lines() {
+        let line = line.map_err(|e| Error::io(e, body.path()))?;
+        let mut it = line.split(' ');
+        let (Some(g), Some(c), Some(v)) = (it.next(), it.next(), it.next()) else {
+            continue;
+        };
+        let gene0: i64 = g.parse::<i64>().unwrap_or(1) - 1;
+        let cb0: u32 = c.parse::<u32>().unwrap_or(0).saturating_sub(1);
+        let col = match remap {
+            Some(map) => match map.get(&cb0) {
+                Some(&col1) => col1 - 1,
+                None => continue,
+            },
+            None => cb0,
+        };
+        if col < current_col {
+            return Err(Error::io(
+                std::io::Error::other(format!(
+                    "matrix body is not in ascending column order (column {col} after {current_col}); \
+                     the HDF5 writer builds column pointers in one pass and relies on that order"
+                )),
+                out_path,
+            ));
+        }
+        // Close every column between the last one and this one, including the
+        // empty columns in between.
+        while current_col < col {
+            indptr.push(data.len() as i64);
+            current_col += 1;
+        }
+        indices.push(gene0);
+        data.push(v.parse::<i32>().unwrap_or(0));
+    }
+    // Close the final column and every trailing empty one.
+    while (indptr.len() as u32) <= barcodes.len() as u32 {
+        indptr.push(data.len() as i64);
+    }
+
+    let bc_refs: Vec<&str> = barcodes.iter().map(String::as_str).collect();
+    let id_refs: Vec<&str> = gene_ids.iter().map(String::as_str).collect();
+    let name_refs: Vec<&str> = gene_names.iter().map(String::as_str).collect();
+    let type_refs: Vec<&str> = vec!["Gene Expression"; n_genes];
+    let genome_refs: Vec<&str> = vec![genome; n_genes];
+    let tag_refs: Vec<&str> = vec!["genome"];
+    let shape: Vec<i32> = vec![n_genes as i32, barcodes.len() as i32];
+
+    // Field widths are the longest value present, which is what makes numpy
+    // report the dataset as `|S<width>`. CellRanger pads to a fixed 256; the
+    // values are identical either way and this keeps the file smaller.
+    let width = |v: &[&str]| v.iter().map(|s| s.len()).max().unwrap_or(1).max(1);
+
+    let features = GroupSpec::new("features")
+        .dataset(
+            "_all_tag_keys",
+            Data::FixedString {
+                width: width(&tag_refs),
+                values: tag_refs,
+            },
+        )
+        .dataset(
+            "feature_type",
+            Data::FixedString {
+                width: width(&type_refs),
+                values: type_refs,
+            },
+        )
+        .dataset(
+            "genome",
+            Data::FixedString {
+                width: width(&genome_refs),
+                values: genome_refs,
+            },
+        )
+        .dataset(
+            "id",
+            Data::FixedString {
+                width: width(&id_refs),
+                values: id_refs,
+            },
+        )
+        .dataset(
+            "name",
+            Data::FixedString {
+                width: width(&name_refs),
+                values: name_refs,
+            },
+        );
+
+    let matrix = GroupSpec::new("matrix")
+        .dataset(
+            "barcodes",
+            Data::FixedString {
+                width: width(&bc_refs),
+                values: bc_refs,
+            },
+        )
+        .dataset("data", Data::I32(&data))
+        .dataset("indices", Data::I64(&indices))
+        .dataset("indptr", Data::I64(&indptr))
+        .dataset("shape", Data::I32(&shape))
+        .group(features);
+
+    // `filetype` and `version` are what a reader dispatches on. The rest is
+    // provenance, and says rustar-aligner rather than claiming to be
+    // CellRanger.
+    let root = GroupSpec::new("/")
+        .group(matrix)
+        .attr("filetype", AttrValue::Str("matrix".to_string()))
+        .attr("version", AttrValue::I64(2))
+        .attr(
+            "software_version",
+            AttrValue::Str(format!("rustar-aligner {}", env!("CARGO_PKG_VERSION"))),
+        )
+        .attr("original_gem_groups", AttrValue::I64Array(vec![1]));
+
+    crate::io::hdf5::write_file(out_path, &root)
+}
+
 /// Write a final `matrix.mtx[.gz]` = MatrixMarket header + (optionally
 /// cb-remapped/filtered) body. With `remap = None` the body is copied verbatim
 /// (raw); with `Some(map)` only columns in the map survive, renumbered to the
@@ -1347,6 +1517,15 @@ pub fn write_gene_matrix(
         ("raw", "filtered")
     };
     let cb_suffix = if cr_layout { "-1" } else { "" };
+    // The `.h5` feature table carries a genome name per feature. CellRanger
+    // uses the name given to `cellranger mkref`; the closest thing we have is
+    // the index directory, which is what `--genomeDir` names.
+    let genome_name = std::path::Path::new(&params.genome_dir)
+        .file_name()
+        .map_or_else(
+            || "genome".to_string(),
+            |s| s.to_string_lossy().into_owned(),
+        );
     // CellRanger has no per-feature directory. Drop ours when there is exactly
     // one feature; keep it when there are several, because collapsing them
     // would have each feature silently overwrite the last.
@@ -1427,6 +1606,39 @@ pub fn write_gene_matrix(
             mstats.nnz,
             raw_remap.as_ref(),
         )?;
+        // CellRanger writes the same matrix twice: the MEX directory above and
+        // an .h5 beside it, which is what read_10x_h5-style loaders open.
+        if cr_layout {
+            let cbs: Vec<u32> = match &observed {
+                Some(cbs) => cbs.clone(),
+                None => (0..sorted.len() as u32).collect(),
+            };
+            // The HDF5 writer holds the barcode strings in memory to size a
+            // fixed-width dataset, so a whitelist-wide raw matrix is costly.
+            // Only reachable by pairing --soloOutLayout CellRanger with an
+            // explicit --soloOutRawBarcodes Whitelist; the layout's own default
+            // is Observed.
+            if cbs.len() > 1_000_000 {
+                log::warn!(
+                    "STARsolo: writing {}.h5 with {} barcode columns; \
+                     --soloOutRawBarcodes Observed would make it far smaller",
+                    raw_name,
+                    cbs.len()
+                );
+            }
+            let h5_path = feature_dir.join(format!("{raw_name}.h5"));
+            write_matrix_h5(
+                &body,
+                &h5_path,
+                n_genes,
+                &barcode_strings(&ctx.whitelist, &cbs, cb_suffix),
+                &ctx.gene_ann.gene_ids,
+                &ctx.gene_ann.gene_names,
+                &genome_name,
+                raw_remap.as_ref(),
+            )?;
+            log::info!("STARsolo: wrote {}", h5_path.display());
+        }
         log::info!(
             "STARsolo: wrote {} matrix ({} genes × {} barcodes, {} entries){}",
             raw_dir.display(),
@@ -1490,6 +1702,20 @@ pub fn write_gene_matrix(
                 cbs.len(),
                 fnnz,
             );
+            if cr_layout {
+                let h5_path = feature_dir.join(format!("{filt_name}.h5"));
+                write_matrix_h5(
+                    &body,
+                    &h5_path,
+                    n_genes,
+                    &barcode_strings(&ctx.whitelist, &cbs, cb_suffix),
+                    &ctx.gene_ann.gene_ids,
+                    &ctx.gene_ann.gene_names,
+                    &genome_name,
+                    Some(&remap),
+                )?;
+                log::info!("STARsolo: wrote {}", h5_path.display());
+            }
         }
 
         // --soloMultiMappers: UniqueAndMult-<method>.mtx alongside raw.

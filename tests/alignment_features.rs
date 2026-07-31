@@ -1181,6 +1181,28 @@ fn test_solo_out_layout_cellranger() {
     assert_eq!(values[18], "1", "one gene detected");
     assert_eq!(values[19], "2", "median 2 UMIs per cell");
     assert!(lines.next().is_none(), "exactly two rows");
+
+    // The two .h5 files CellRanger writes beside the MEX directories, from the
+    // in-tree HDF5 writer. The suite cannot link libhdf5, so it checks what it
+    // can from the outside: the format signature, and that the superblock's
+    // end-of-file address is the file's actual length (which is what a
+    // truncated or over-long write would break). `test/h5_conformance.sh` runs
+    // the real check with libhdf5 and the readers.
+    for name in ["raw_feature_bc_matrix.h5", "filtered_feature_bc_matrix.h5"] {
+        let p = output_dir.join("outs").join(name);
+        let bytes = fs::read(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+        assert_eq!(
+            &bytes[..8],
+            &[0x89, b'H', b'D', b'F', b'\r', b'\n', 0x1a, b'\n'],
+            "{name} does not start with the HDF5 signature"
+        );
+        let eof = u64::from_le_bytes(bytes[40..48].try_into().unwrap());
+        assert_eq!(
+            eof as usize,
+            bytes.len(),
+            "{name} superblock end-of-file address disagrees with the file length"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

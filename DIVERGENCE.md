@@ -207,6 +207,58 @@ rather than taken from its source.
 
 ---
 
+### 3.5 `*_feature_bc_matrix.h5` written without libhdf5 (non-STAR)
+
+**What STAR does.** STARsolo writes MEX only. It has no HDF5 output.
+
+**What rustar-aligner does.** The same, by default. Under
+`--soloOutLayout CellRanger` it additionally writes
+`raw_feature_bc_matrix.h5` and `filtered_feature_bc_matrix.h5` beside the MEX
+directories, holding the same counts in CellRanger's HDF5 layout.
+
+**Why.** `scanpy.read_10x_h5`, Seurat's `Read10X_h5` and CellBender's `.h5`
+path all read that single file, and a good deal of 10x tooling reaches for it
+in preference to the directory.
+
+**How, and why that is the divergence.** The file is produced by
+`src/io/hdf5.rs`, a writer in this repository, not by libhdf5. A binding would
+mean either a system `libhdf5` — which would make `cargo install
+rustar-aligner` fail on a machine without it — or `cmake` and a multi-minute C
+build on all five CI targets, for one optional output file. The maintainer
+declined both, so the file is written directly.
+
+The writer emits the oldest and most widely-read variant of each structure:
+version 0 superblock, version 1 object headers, symbol-table groups with a
+version 1 B-tree and a local heap, and contiguous uncompressed datasets. It
+does not chunk, compress, or write variable-length types.
+
+**Where the file differs from CellRanger's.** CellRanger gzip-compresses its
+datasets and pads every string field to 256 bytes; ours are uncompressed and
+padded to the longest value present. Readers see identical values either way —
+the difference is on-disk size and the `|S<n>` width numpy reports. The
+`genome` field carries the `--genomeDir` directory name, since we have no
+equivalent of the name given to `cellranger mkref`, and `software_version`
+says `rustar-aligner`, not a CellRanger version.
+
+**Impact.** No count changes: the `.h5` and the `.mtx` were compared entry by
+entry on the fixture and hold the same 13 959 entries and 15 439 counts.
+
+**How it is checked.** `cargo test` cannot validate an HDF5 file, so it locks
+determinism and the byte layout with a checksum, and the real check is
+`test/h5_conformance.sh`, which runs the HDF5 command-line tools and the
+readers. On the fixture: `h5ls -r`, `h5dump -H` and `h5stat` all succeed, an
+`h5repack` round-trip through libhdf5 followed by `h5diff` reports no
+difference, and scanpy's and CellBender's loaders both return the expected
+matrix. That script must be re-run, off CI, whenever `src/io/hdf5.rs` changes:
+only libhdf5 can say whether new bytes are still a valid file.
+
+**Source.** `src/io/hdf5.rs`, `src/solo/count.rs` (`write_matrix_h5`). Format:
+*HDF5 File Format Specification Version 3.0*. CellRanger: the `.h5` of a
+`cellranger count` 10.0.0 run, inspected with `h5py` rather than taken from its
+source.
+
+---
+
 ## 4. Implementation divergences (no intended output difference)
 
 These differ in *how* a result is produced, not *what* is produced. They are documented so a reviewer chasing a discrepancy knows the mechanism differs by design.

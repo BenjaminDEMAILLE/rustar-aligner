@@ -13,6 +13,14 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Features
 
+- Under `--soloOutLayout CellRanger`, `raw_feature_bc_matrix.h5` and
+  `filtered_feature_bc_matrix.h5` are written beside the MEX directories,
+  holding the same counts in CellRanger's HDF5 layout, so
+  `scanpy.read_10x_h5`, Seurat's `Read10X_h5` and CellBender's `.h5` path
+  read them. Written by an in-tree HDF5 writer (`src/io/hdf5.rs`): **no new
+  dependency**, no libhdf5, no `cmake`. See `DIVERGENCE.md` §3.5 and
+  `test/h5_conformance.sh`.
+
 - Under `--soloOutLayout CellRanger`, `metrics_summary.csv` is written with
   CellRanger 10.0.0's 20 metrics, in its order and value formats. STARsolo's
   `Summary.csv` is unchanged and still written alongside. Twelve of the 20
