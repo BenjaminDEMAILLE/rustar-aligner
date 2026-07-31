@@ -48,13 +48,21 @@ PYTHON=${PYTHON:-python3}
 if ! "$PYTHON" -c "import h5py, scipy" 2>/dev/null; then
   printf '   SKIP %s\n' "$PYTHON has no h5py/scipy; set PYTHON to an interpreter that does"
 else
-"$PYTHON" - "$F" <<'PY' && ok "scanpy read_10x_h5 + CellBender loader" || bad "python readers"
+"$PYTHON" - "$F" <<'PY' && ok "python readers" || bad "python readers"
 import sys
 import h5py
 import scipy.sparse as sp
 import numpy as np
 
 path = sys.argv[1]
+
+# These two readers only apply to a feature-barcode matrix. The writer is also
+# used for other trees (its own golden test file, for one), and those are
+# checked by the libhdf5 steps above.
+with h5py.File(path, 'r') as f:
+    if '/matrix' not in f or 'barcodes' not in f['matrix']:
+        print("   not a feature-barcode matrix; skipping the 10x readers")
+        sys.exit(0)
 
 # scanpy's _read_v3_10x_h5, transcribed.
 with h5py.File(path, 'r') as f:

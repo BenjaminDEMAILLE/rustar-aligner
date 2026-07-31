@@ -10,18 +10,19 @@
 //! # What it writes
 //!
 //! Version 0 superblock, version 1 object headers, old-style groups (symbol
-//! table + version 1 B-tree + local heap), and contiguous, uncompressed
-//! datasets. Every one of those is the oldest and most widely-read variant of
-//! its structure, which is deliberate: this writer's only job is to produce
-//! files other people's readers open.
+//! table + version 1 B-tree + local heap), and datasets stored either
+//! contiguously or as a single deflate-compressed chunk. Every one of those is
+//! the oldest and most widely-read variant of its structure, which is
+//! deliberate: this writer's only job is to produce files other people's
+//! readers open.
 //!
 //! # What it does not write
 //!
-//! No chunking, no compression, no variable-length types, no references, no
-//! links other than the hard links in a group's symbol table, no deletion, no
-//! rewriting. Every dataset is written once, in full, from a slice already in
-//! memory. Groups hold at most `2 * GROUP_LEAF_K` = 8 entries, since a second
-//! B-tree node would need node splitting and nothing here comes close.
+//! No variable-length types, no references, no links other than the hard links
+//! in a group's symbol table, no deletion, no rewriting. Every dataset is
+//! written once, in full, from a slice already in memory, as one chunk rather
+//! than many. Groups hold at most `2 * GROUP_LEAF_K` = 8 entries, since a
+//! second B-tree node would need node splitting and nothing here comes close.
 //!
 //! The layout constants and structure layouts follow the *HDF5 File Format
 //! Specification Version 3.0* (superblock §II.A, B-trees §II.A.1, local heaps
@@ -64,6 +65,7 @@ const SUPERBLOCK_LEN: usize = 96;
 const MSG_DATASPACE: u16 = 0x0001;
 const MSG_DATATYPE: u16 = 0x0003;
 const MSG_FILL_VALUE: u16 = 0x0005;
+const MSG_FILTER_PIPELINE: u16 = 0x000B;
 const MSG_DATA_LAYOUT: u16 = 0x0008;
 const MSG_ATTRIBUTE: u16 = 0x000C;
 const MSG_SYMBOL_TABLE: u16 = 0x0011;
@@ -307,10 +309,28 @@ fn dataspace_message(dims: &[u64]) -> Vec<u8> {
     m
 }
 
+/// Space allocation time in a fill value message: when the library would
+/// reserve the dataset's storage. `Late` for contiguous storage, `Incremental`
+/// for chunked, which is what HDF5 itself writes and what `h5diff` expects to
+/// find on a chunked dataset.
+const ALLOC_LATE: u8 = 2;
+const ALLOC_INCREMENTAL: u8 = 3;
+
 /// Fill value message, version 2, with no fill value defined: readers use the
 /// type's default. Nothing here is ever read before it is written.
-fn fill_value_message() -> Vec<u8> {
-    vec![2, 2, 0, 0] // version, space allocation time (early), write time, undefined
+///
+/// The write time is `H5D_FILL_TIME_IFSET` (2), i.e. write the fill value only
+/// if one was set. With `Late` allocation and a write time of "on allocation",
+/// `h5diff` refuses a chunked dataset outright — the two say storage is
+/// reserved late but filled at reservation.
+fn fill_value_message(alloc_time: u8) -> Vec<u8> {
+    // version, allocation time, write time, "fill value defined", then a
+    // zero-length value, which is how HDF5 spells "use the type's default".
+    // Writing "not defined" (0) instead leaves a file h5dump reads but
+    // h5repack rewrites incorrectly.
+    let mut m = vec![2, alloc_time, 2, 1];
+    m.extend_from_slice(&0u32.to_le_bytes()); // size of the fill value
+    m
 }
 
 /// Data layout message, version 3, contiguous storage at `addr` for `size`
@@ -322,6 +342,120 @@ fn data_layout_message(addr: u64, size: u64) -> Vec<u8> {
     m.extend_from_slice(&addr.to_le_bytes());
     m.extend_from_slice(&size.to_le_bytes());
     m
+}
+
+/// Data layout message, version 3, chunked storage.
+///
+/// `btree` is the address of the chunk index; `chunk_len` is the chunk's length
+/// in elements and `elem_size` the element size in bytes. The dimensionality
+/// field counts one more than the dataset's rank, because HDF5 treats the
+/// element size as a trailing dimension of the chunk.
+fn chunked_layout_message(btree: u64, chunk_len: u32, elem_size: u32) -> Vec<u8> {
+    let mut m = Vec::with_capacity(19);
+    m.push(3); // version
+    m.push(2); // class 2: chunked
+    m.push(2); // dimensionality: rank 1, plus the element-size dimension
+    m.extend_from_slice(&btree.to_le_bytes());
+    m.extend_from_slice(&chunk_len.to_le_bytes());
+    m.extend_from_slice(&elem_size.to_le_bytes());
+    m
+}
+
+/// Filter pipeline message, version 1, with a single deflate filter.
+///
+/// Filter id 1 is `H5Z_FILTER_DEFLATE`. Its one client-data value is the
+/// compression level, which readers ignore — zlib streams are self-describing —
+/// but which is part of the message HDF5 writes and expects to parse back.
+///
+/// Version 1 stores the filter name, null-terminated and padded to a multiple
+/// of 8 bytes; `"deflate"` is what the library writes there.
+fn filter_pipeline_message(level: u32) -> Vec<u8> {
+    const NAME: &[u8; 8] = b"deflate\0";
+    let mut m = Vec::with_capacity(32);
+    m.push(1); // version
+    m.push(1); // number of filters
+    m.extend_from_slice(&[0; 6]); // reserved
+    m.extend_from_slice(&1u16.to_le_bytes()); // filter id: deflate
+    m.extend_from_slice(&(NAME.len() as u16).to_le_bytes());
+    m.extend_from_slice(&0u16.to_le_bytes()); // flags: the filter is mandatory
+    m.extend_from_slice(&1u16.to_le_bytes()); // one client data value
+    m.extend_from_slice(NAME);
+    m.extend_from_slice(&level.to_le_bytes());
+    // An odd number of client data values is padded to a multiple of 8 bytes.
+    m.extend_from_slice(&[0; 4]);
+    m
+}
+
+/// A version 1 B-tree indexing the chunks of one dataset (node type 1).
+///
+/// One chunk per dataset, so this is a single leaf holding one entry. A chunk
+/// key is the chunk's stored size, its filter mask, and its offset in the
+/// dataset — one offset per dimension plus a trailing zero for the element-size
+/// dimension. The trailing key marks the end of the last chunk, which is how a
+/// reader knows where the indexed space stops.
+fn chunk_btree_node(chunk_addr: u64, chunk_size: u32, n_elements: u64) -> Vec<u8> {
+    /// The default `H5F_CRT_BTREE_RANK` for chunk B-trees. Superblock version 0
+    /// records only the group node K values, so a reader takes this one from the
+    /// library default and sizes the node accordingly; the node therefore has to
+    /// be allocated at full capacity even holding one entry.
+    const CHUNK_BTREE_K: usize = 32;
+
+    let key = |size: u32, offset: u64| {
+        let mut k = Vec::with_capacity(24);
+        k.extend_from_slice(&size.to_le_bytes());
+        k.extend_from_slice(&0u32.to_le_bytes()); // filter mask: all filters applied
+        k.extend_from_slice(&offset.to_le_bytes()); // offset along dimension 0
+        k.extend_from_slice(&0u64.to_le_bytes()); // element-size dimension
+        k
+    };
+
+    let mut b = Vec::new();
+    b.extend_from_slice(b"TREE");
+    b.push(1); // node type 1: raw data chunks
+    b.push(0); // level 0: leaf
+    b.extend_from_slice(&1u16.to_le_bytes()); // entries used
+    b.extend_from_slice(&UNDEF_ADDR.to_le_bytes()); // left sibling
+    b.extend_from_slice(&UNDEF_ADDR.to_le_bytes()); // right sibling
+    b.extend_from_slice(&key(chunk_size, 0));
+    b.extend_from_slice(&chunk_addr.to_le_bytes());
+    b.extend_from_slice(&key(0, n_elements));
+    let key_len = 24;
+    b.resize(
+        24 + 2 * CHUNK_BTREE_K * (key_len + SIZEOF_ADDR) + key_len,
+        0,
+    );
+    b
+}
+
+/// Datasets at or below this many raw bytes are stored contiguously.
+///
+/// Compressing them would cost a chunk B-tree (about 2 kB, allocated at full
+/// capacity whatever the occupancy) and a filter pipeline message to save a few
+/// hundred bytes. CellRanger draws the same line in the same place: its
+/// `_all_tag_keys` is the one dataset it leaves uncompressed.
+const COMPRESSION_THRESHOLD: usize = 1024;
+
+/// zlib compression level for dataset chunks. 6 is zlib's default and what
+/// CellRanger's files decompress as.
+const COMPRESSION_LEVEL: u32 = 6;
+
+/// Compress a chunk in the zlib format (RFC 1950) that HDF5's deflate filter
+/// expects — not raw deflate, and not gzip.
+fn deflate_chunk(raw: &[u8]) -> Vec<u8> {
+    let lvl = libdeflater::CompressionLvl::new(COMPRESSION_LEVEL as i32).unwrap_or_default();
+    let mut c = libdeflater::Compressor::new(lvl);
+    let mut out = vec![0u8; c.zlib_compress_bound(raw.len())];
+    match c.zlib_compress(raw, &mut out) {
+        Ok(n) => {
+            out.truncate(n);
+            out
+        }
+        // libdeflate only fails here if the output buffer is too small, which
+        // `zlib_compress_bound` rules out. Falling back to the uncompressed
+        // bytes would produce a file whose filter says otherwise, so this
+        // cannot silently degrade.
+        Err(e) => unreachable!("libdeflate zlib_compress failed on a bounded buffer: {e:?}"),
+    }
 }
 
 /// One object header message, prefixed and padded as the header expects.
@@ -438,23 +572,59 @@ fn write_group(img: &mut Image, group: &GroupSpec<'_>) -> Result<WrittenGroup, S
 
     for ds in &group.datasets {
         let bytes = ds.data.bytes()?;
-        let data_addr = if bytes.is_empty() {
-            // A zero-length dataset still needs an address; point it at the
-            // current end of file rather than at the undefined address, which
-            // some readers treat as "not allocated" and then refuse to read.
-            img.reserve(0)
-        } else {
-            img.alloc(&bytes)
-        };
-        let messages = vec![
-            header_message(MSG_DATASPACE, &dataspace_message(&[ds.data.len() as u64])),
+        let n = ds.data.len();
+
+        // Anything worth compressing is stored as a single deflated chunk
+        // covering the whole dataset; everything else is contiguous. One chunk
+        // means one B-tree entry and no node splitting, and costs nothing in
+        // practice because every reader of these files loads each dataset
+        // whole.
+        let mut messages = vec![
+            header_message(MSG_DATASPACE, &dataspace_message(&[n as u64])),
             header_message(MSG_DATATYPE, &ds.data.datatype()),
-            header_message(MSG_FILL_VALUE, &fill_value_message()),
-            header_message(
+        ];
+        if bytes.len() > COMPRESSION_THRESHOLD && u32::try_from(n).is_ok() {
+            let chunk = deflate_chunk(&bytes);
+            let chunk_size = u32::try_from(chunk.len()).map_err(|_| {
+                format!(
+                    "dataset {:?} compresses to {} bytes, past the 4 GB a chunk record holds",
+                    ds.name,
+                    chunk.len()
+                )
+            })?;
+            let chunk_addr = img.alloc(&chunk);
+            let btree_addr = img.alloc(&chunk_btree_node(chunk_addr, chunk_size, n as u64));
+            messages.push(header_message(
+                MSG_FILL_VALUE,
+                &fill_value_message(ALLOC_INCREMENTAL),
+            ));
+            messages.push(header_message(
+                MSG_FILTER_PIPELINE,
+                &filter_pipeline_message(COMPRESSION_LEVEL),
+            ));
+            messages.push(header_message(
+                MSG_DATA_LAYOUT,
+                &chunked_layout_message(btree_addr, n as u32, ds.data.element_size() as u32),
+            ));
+        } else {
+            let data_addr = if bytes.is_empty() {
+                // A zero-length dataset still needs an address; point it at the
+                // current end of file rather than at the undefined address,
+                // which some readers treat as "not allocated" and then refuse
+                // to read.
+                img.reserve(0)
+            } else {
+                img.alloc(&bytes)
+            };
+            messages.push(header_message(
+                MSG_FILL_VALUE,
+                &fill_value_message(ALLOC_LATE),
+            ));
+            messages.push(header_message(
                 MSG_DATA_LAYOUT,
                 &data_layout_message(data_addr, bytes.len() as u64),
-            ),
-        ];
+            ));
+        }
         let hdr = img.alloc(&object_header(&messages));
         children.push((ds.name.to_string(), hdr, 0, [0u8; 16]));
     }
@@ -737,28 +907,53 @@ mod tests {
         assert_eq!(d.bytes().unwrap(), vec![0xff; 8]);
     }
 
+    /// The canonical tiny file the golden checks below are taken from: one
+    /// small dataset, which stays contiguous, and one past the compression
+    /// threshold, which becomes a deflated chunk. Both storage paths in one
+    /// image.
+    fn golden_tree() -> Vec<u8> {
+        let big: Vec<i32> = (0..1000).collect();
+        let root = GroupSpec::new("/")
+            .group(
+                GroupSpec::new("matrix")
+                    .dataset("shape", Data::I32(&[3, 2]))
+                    .dataset("data", Data::I32(&big)),
+            )
+            .attr("filetype", AttrValue::Str("matrix".into()));
+        build(&root).unwrap()
+    }
+
     /// The image is byte-deterministic: no timestamps, no allocator addresses,
     /// nothing that varies between runs. Determinism is a project-wide property
     /// and this is the file format most likely to smuggle in a violation.
     ///
     /// The checksum also locks the layout. It was produced from an image that
-    /// HDF5 1.14.6 accepted — `h5dump -H`, `h5ls -r`, and an `h5repack` +
-    /// `h5diff` round-trip reporting no difference (`test/h5_conformance.sh`).
-    /// If a change to this module moves it, re-run that script before updating
-    /// the constant, because only libhdf5 can say whether the new bytes are
-    /// still a valid file.
+    /// HDF5 accepted — `h5dump -H`, `h5ls -r`, and an `h5repack` + `h5diff`
+    /// round-trip reporting no difference (`test/h5_conformance.sh`). If a
+    /// change to this module moves it, re-run that script before updating the
+    /// constant, because only libhdf5 can say whether the new bytes are still a
+    /// valid file. That is not hypothetical: an earlier version of this writer
+    /// passed every check here and every reader, and still produced a file
+    /// `h5repack` rewrote incorrectly.
     #[test]
     fn the_image_is_deterministic_and_matches_the_validated_layout() {
-        let build_it = || {
-            let root = GroupSpec::new("/")
-                .group(GroupSpec::new("matrix").dataset("data", Data::I32(&[1, 2])))
-                .attr("filetype", AttrValue::Str("matrix".into()));
-            build(&root).unwrap()
-        };
-        let a = build_it();
-        assert_eq!(a, build_it(), "two builds of the same tree differ");
-        assert_eq!(a.len(), 2192, "image length");
-        assert_eq!(fnv1a(&a), 0x67f1_1bdc_8bcd_42e4, "image checksum");
+        let a = golden_tree();
+        assert_eq!(a, golden_tree(), "two builds of the same tree differ");
+        assert_eq!(a.len(), 5880, "image length");
+        assert_eq!(fnv1a(&a), 0x3d97_d0d0_6d6a_5a2e, "image checksum");
+    }
+
+    /// Writing the golden image out, for `test/h5_conformance.sh` to check with
+    /// libhdf5. Ignored by default: it produces a file rather than asserting
+    /// anything.
+    ///
+    ///   cargo test --lib write_golden_h5 -- --ignored --nocapture
+    #[test]
+    #[ignore = "writes a file for external validation rather than asserting"]
+    fn write_golden_h5() {
+        let path = std::env::temp_dir().join("rustar_golden.h5");
+        std::fs::write(&path, golden_tree()).unwrap();
+        println!("wrote {}", path.display());
     }
 
     /// FNV-1a, for the golden check above. Not a security property: a
@@ -766,7 +961,7 @@ mod tests {
     fn fnv1a(bytes: &[u8]) -> u64 {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         for b in bytes {
-            h ^= *b as u64;
+            h ^= u64::from(*b);
             h = h.wrapping_mul(0x1000_0000_01b3);
         }
         h

@@ -229,15 +229,19 @@ declined both, so the file is written directly.
 
 The writer emits the oldest and most widely-read variant of each structure:
 version 0 superblock, version 1 object headers, symbol-table groups with a
-version 1 B-tree and a local heap, and contiguous uncompressed datasets. It
-does not chunk, compress, or write variable-length types.
+version 1 B-tree and a local heap, and datasets stored either contiguously or
+as a single deflate-compressed chunk indexed by a version 1 chunk B-tree. It
+does not write variable-length types, and it never splits a dataset into more
+than one chunk.
 
-**Where the file differs from CellRanger's.** CellRanger gzip-compresses its
-datasets and pads every string field to 256 bytes; ours are uncompressed and
-padded to the longest value present. Readers see identical values either way —
-the difference is on-disk size and the `|S<n>` width numpy reports. The
-`genome` field carries the `--genomeDir` directory name, since we have no
-equivalent of the name given to `cellranger mkref`, and `software_version`
+**Where the file differs from CellRanger's.** Both deflate their datasets at
+level 6. CellRanger pads every string field to 256 bytes and chunks at 65 536
+elements; ours are padded to the longest value present and stored as one chunk
+per dataset. Readers see identical values either way — the difference is
+on-disk size and the `|S<n>` width numpy reports. On the fixture ours is 88 216
+bytes against CellRanger's 149 472, the string padding accounting for most of
+it. The `genome` field carries the `--genomeDir` directory name, since we have
+no equivalent of the name given to `cellranger mkref`, and `software_version`
 says `rustar-aligner`, not a CellRanger version.
 
 **Impact.** No count changes: the `.h5` and the `.mtx` were compared entry by
