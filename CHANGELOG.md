@@ -13,6 +13,12 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Features
 
+- On 10x geometry (`CB_UMI_Simple`, a whitelist, 16 bp CB, 10 or 12 bp
+  UMI), the five CellRanger-matching flags now **default** to their
+  CellRanger values. Any flag named on the command line wins, and the
+  substitution is logged. **This changes default output on 10x runs** and
+  diverges from STARsolo; see `DIVERGENCE.md` §1.3.
+
 - `--soloOutRawBarcodes Observed` writes the raw matrix with one column
   per *observed* barcode instead of one per whitelist barcode, matching
   what CellRanger's `raw_feature_bc_matrix` contains. Counts are
