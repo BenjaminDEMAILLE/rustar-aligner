@@ -1147,6 +1147,40 @@ fn test_solo_out_layout_cellranger() {
     assert_eq!(f_barcodes.lines().next().unwrap(), format!("{cb}-1"));
     let f_matrix = gunzip(&filt.join("matrix.mtx.gz"));
     assert_eq!(f_matrix.lines().last().unwrap(), "1 1 2");
+
+    // metrics_summary.csv: CellRanger 10.0.0's 20 metrics, in its order, as a
+    // header row and a value row. The header is compared against the literal
+    // string from a real CellRanger run.
+    let metrics = fs::read_to_string(output_dir.join("outs").join("metrics_summary.csv")).unwrap();
+    let mut lines = metrics.lines();
+    assert_eq!(
+        lines.next().unwrap(),
+        "Estimated Number of Cells,Mean Reads per Cell,Median Genes per Cell,\
+         Number of Reads,Valid Barcodes,Valid UMI Sequences,Sequencing Saturation,\
+         Q30 Bases in Barcode,Q30 Bases in RNA Read,Q30 Bases in UMI,\
+         Reads Mapped to Genome,Reads Mapped Confidently to Genome,\
+         Reads Mapped Confidently to Intergenic Regions,\
+         Reads Mapped Confidently to Intronic Regions,\
+         Reads Mapped Confidently to Exonic Regions,\
+         Reads Mapped Confidently to Transcriptome,Reads Mapped Antisense to Gene,\
+         Fraction Reads in Cells,Total Genes Detected,Median UMI Counts per Cell"
+    );
+    let values: Vec<&str> = lines.next().unwrap().split(',').collect();
+    // 20 metrics; 8 reads, so no field is large enough to be comma-quoted.
+    assert_eq!(values.len(), 20);
+    assert_eq!(values[0], "1", "one called cell");
+    assert_eq!(values[3], "8", "8 reads");
+    assert_eq!(values[4], "100.0%", "all barcodes valid");
+    assert_eq!(values[5], "100.0%", "all UMIs valid");
+    // 8 reads collapsing to 2 molecules: 6 of the 8 added nothing.
+    assert_eq!(values[6], "75.0%", "sequencing saturation");
+    // The fixture writes 'I' (Phred 40) for every base.
+    assert_eq!(values[7], "100.0%", "Q30 in barcode");
+    assert_eq!(values[8], "100.0%", "Q30 in RNA read");
+    assert_eq!(values[9], "100.0%", "Q30 in UMI");
+    assert_eq!(values[18], "1", "one gene detected");
+    assert_eq!(values[19], "2", "median 2 UMIs per cell");
+    assert!(lines.next().is_none(), "exactly two rows");
 }
 
 // ---------------------------------------------------------------------------

@@ -13,6 +13,12 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Features
 
+- Under `--soloOutLayout CellRanger`, `metrics_summary.csv` is written with
+  CellRanger 10.0.0's 20 metrics, in its order and value formats. STARsolo's
+  `Summary.csv` is unchanged and still written alongside. Twelve of the 20
+  match a real `cellranger count` run exactly on the test fixture; the
+  interpretation behind the other eight is in `DIVERGENCE.md` §3.4.
+
 - `--soloOutLayout CellRanger` writes the solo matrices in the shape
   `cellranger count` produces: `outs/raw_feature_bc_matrix/` and
   `outs/filtered_feature_bc_matrix/`, gzipped, with a `-1` GEM-well suffix
