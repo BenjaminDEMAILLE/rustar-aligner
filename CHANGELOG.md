@@ -44,6 +44,15 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 - Read names are cut at `--readNameSeparator` (default `/`), as STAR does. A
   read named `foo/1` was previously emitted as `foo/1` where STAR emits `foo`.
+- `--soloOutLayout CellRanger` writes the solo matrices in the shape
+  `cellranger count` produces: `outs/raw_feature_bc_matrix/` and
+  `outs/filtered_feature_bc_matrix/`, gzipped, with a `-1` GEM-well suffix
+  on every barcode and one raw column per observed barcode. It implies
+  `--soloOutGzip yes`, `--soloOutRawBarcodes Observed` and an `outs/`
+  output directory, each still overridable on the command line. Counts are
+  unchanged. It is the default on 10x geometry, which **changes where
+  output files are written** on those runs; see `DIVERGENCE.md` §3.3.
+
 - On 10x geometry (`CB_UMI_Simple`, a whitelist, 16 bp CB, 10 or 12 bp
   UMI), the five CellRanger-matching flags now **default** to their
   CellRanger values. Any flag named on the command line wins, and the
