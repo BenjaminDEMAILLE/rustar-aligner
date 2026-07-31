@@ -1921,7 +1921,7 @@ impl Parameters {
 
 /// The flags STAR documents for matching CellRanger 4.x/5.x
 /// (`docs/STARsolo.md`), applied by default when the run is a 10x one.
-const CELLRANGER_DEFAULTS: [(&str, &str); 6] = [
+const CELLRANGER_DEFAULTS: [(&str, &str); 7] = [
     ("clip_adapter_type", "CellRanger4"),
     ("out_filter_score_min", "30"),
     ("solo_cb_match_wl_type", "1MM_multi_Nbase_pseudocounts"),
@@ -1930,6 +1930,10 @@ const CELLRANGER_DEFAULTS: [(&str, &str); 6] = [
     // Not a STAR flag: the output layout, so a 10x run lands where a tool
     // written against `cellranger count` expects to find it.
     ("solo_out_layout", "CellRanger"),
+    // CellRanger has counted intronic reads toward the gene since v7.0.
+    // STARsolo's `Gene` is exonic-only, which on human data is 30% below
+    // CellRanger; `GeneFull` is the equivalent of its default.
+    ("solo_features", "GeneFull"),
 ];
 
 /// Does this look like a 10x Chromium run?
@@ -1982,6 +1986,7 @@ fn apply_cellranger_defaults_on_10x(params: &mut Parameters, matches: &clap::Arg
             "solo_umi_filtering" => params.solo_umi_filtering = vec![value.to_string()],
             "solo_umi_dedup" => params.solo_umi_dedup = vec![value.to_string()],
             "solo_out_layout" => params.solo_out_layout = value.to_string(),
+            "solo_features" => params.solo_features = vec![value.to_string()],
             _ => continue,
         }
         applied.push(value);
@@ -2062,6 +2067,39 @@ mod tests {
         assert_eq!(p.solo_umi_filtering, vec!["MultiGeneUMI_CR".to_string()]);
         assert_eq!(p.solo_umi_dedup, vec!["1MM_CR".to_string()]);
         assert_eq!(p.solo_out_layout, "CellRanger");
+        assert_eq!(p.solo_features, vec!["GeneFull".to_string()]);
+    }
+
+    /// `--soloFeatures` given explicitly wins, so a user who wants STARsolo's
+    /// exonic-only counting on 10x data still gets it.
+    #[test]
+    fn an_explicit_solo_features_beats_the_10x_intron_default() {
+        let p = Parameters::try_parse_from([
+            "rustar-aligner",
+            "--readFilesIn",
+            "cdna.fq",
+            "cb.fq",
+            "--sjdbGTFfile",
+            "genes.gtf",
+            "--soloType",
+            "CB_UMI_Simple",
+            "--soloCBwhitelist",
+            "wl.txt",
+            "--soloCBstart",
+            "1",
+            "--soloCBlen",
+            "16",
+            "--soloUMIstart",
+            "17",
+            "--soloUMIlen",
+            "12",
+            "--soloFeatures",
+            "Gene",
+        ])
+        .unwrap();
+        assert_eq!(p.solo_features, vec!["Gene".to_string()]);
+        // The rest of the CellRanger defaults still apply.
+        assert_eq!(p.solo_umi_dedup, vec!["1MM_CR".to_string()]);
     }
 
     /// `--soloOutLayout CellRanger` pulls three existing flags and the output

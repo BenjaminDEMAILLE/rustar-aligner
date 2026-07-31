@@ -13,6 +13,13 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Features
 
+- On 10x geometry, `--soloFeatures` now defaults to `GeneFull` rather than
+  `Gene`: CellRanger has counted intronic reads toward the gene since v7.0.
+  Measured on 10x's `pbmc_1k_v3`, exonic-only counting is 30.5% below
+  CellRanger and `GeneFull` brings it to 1.6%. **This changes default counts
+  on 10x runs**; naming `--soloFeatures` explicitly still wins. See
+  `DIVERGENCE.md` §1.3.
+
 - `--soloCellFilter OrdMag` implements CellRanger's cell call: the same
   quantile-over-ratio rule as `CellRanger2.2`, but searching for the expected
   cell count by minimising `(OrdMag(x) - x)^2 / x` instead of fixing it at
