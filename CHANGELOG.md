@@ -114,6 +114,29 @@ Sections commonly used: Features, Bug fixes, Other changes.
   and a matrix produced elsewhere should be callable too. It streams
   the matrix into the same form the align path produces, so the filters
   are the identical code rather than a second implementation.
+- **`--soloCellFilter EmptyDrops_CR` now uses CellRanger's actual
+  statistics.** The ambient profile is smoothed with Simple Good-Turing,
+  as CellRanger and STAR do, instead of an approximation that reserved
+  unseen mass from the singleton rate and spread the remainder in
+  proportion to raw counts. The Monte-Carlo null is drawn with libc++'s
+  `std::mt19937` and `std::discrete_distribution`, seeded
+  `19760110 * (isim + 1)` per simulation as STAR seeds it, replacing a
+  SplitMix64 stream that could not agree with STAR's over an arbitrary
+  number of draws. Cell calls move as a result.
+
+- **`--soloFeatures Transcript3p`** quantifies transcripts rather than
+  genes, using how far each read's 3' end sits from each transcript's.
+  In a 3'-biased assay that distance discriminates between isoforms: a
+  read 200 bases from the end of one and 4000 from the end of another
+  is evidence for the first. The distance distribution is estimated
+  from the data, then used as the likelihood in an EM over UMIs. Output
+  is per *cluster* rather than per cell — `--soloClusterCBfile` (new,
+  and required for this feature) says which cell is in which cluster,
+  because one cell has too few UMIs to resolve isoforms. Reads sharing
+  a UMI contribute the intersection of their transcript sets, not the
+  union: they came from one molecule. Writes `matrix.mtx`,
+  `features.tsv` and `transcriptEndDistanceDistribution.txt` under
+  `Solo.out/Transcript3p/raw/`.
 
 ### Bug fixes
 
@@ -121,6 +144,16 @@ Sections commonly used: Features, Bug fixes, Other changes.
   rayon pool was configured only above 1, and skipping it leaves rayon's
   default of one worker per core. Output is unchanged; the run now uses
   the thread count asked for.
+- `--soloUMIfiltering MultiGeneUMI_CR` kept every gene tied at the
+  highest read count; CellRanger gives a tied UMI to no gene at all.
+  Since one read per gene is the ordinary shape of a multi-gene UMI, the
+  flag removed nothing in practice. On a 20k-read 10x fixture the count
+  matrix moves from 16 465 to 15 414 against STAR's 15 423.
+- `--soloUMIfiltering MultiGeneUMI_All` was aliased to `MultiGeneUMI`,
+  which is neither STAR's behaviour nor the documented one: in STAR
+  2.7.11b the variant is a no-op. It now removes a UMI seen in two or
+  more genes from **all** of them, the behaviour the option name
+  describes. Recorded in `DIVERGENCE.md` (closes #144).
 
 - **STARsolo `Gene` assignment now requires exon concordance**, matching
   STARsolo: a read counts toward a gene only when every aligned block
