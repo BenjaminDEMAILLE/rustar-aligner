@@ -13,6 +13,15 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Other changes
 
+- **Optional `rapidgzip` feature** for parallel gzip/BGZF decoding of
+  `--readFilesIn`, backed by the pure-Rust `rapidgzip-core` (inflate backend is
+  zlib-rs, the same one `flate2` uses here, so it adds no C toolchain). Off by
+  default and inert until `RUSTAR_GZ_DECODE_THREADS` is set: the decoder reaches
+  3356 MB/s on 8 threads against 1552 MB/s for one `flate2` thread, but the
+  aligner only consumes ~140 MB/s of decompressed FASTQ, so decode was never the
+  bottleneck and enabling it measured slightly slower with ~360 MB more resident.
+  Output is byte-identical to the `flate2` path.
+
 - `cluster_seeds` reuses its window-bin map across reads on a thread instead
   of rebuilding it per read. Merging two windows re-keys every bin in the
   merged span, so the per-read pre-sizing was only a floor and the map
