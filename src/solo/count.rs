@@ -955,14 +955,11 @@ fn filter_multi_gene_umi(genes: &HashMap<u32, u32>, filtering: UmiFiltering) -> 
             let thresh = if max == 1 { 2 } else { max };
             genes.iter().filter(|&(_, &rc)| rc >= thresh).collect()
         }
-<<<<<<< HEAD
         // A UMI that appears in more than one gene is evidence of a collision
         // or of chimeric amplification, so it is discarded outright rather than
         // attributed to whichever gene happened to read deepest. `genes.len()`
         // is already known to be > 1 here.
         UmiFiltering::MultiGeneUmiAll => Vec::new(),
-=======
->>>>>>> 51304b5 (fix(solo): MultiGeneUMI_CR gives a tied UMI to nobody, not to everybody)
         // CellRanger: the gene with the strictly highest read count takes the
         // UMI, and a tie gives it to nobody.
         //
@@ -2632,10 +2629,6 @@ mod tests {
     /// the ties made `--soloUMIfiltering MultiGeneUMI_CR` inert in practice:
     /// on a 20 000-read 10x fixture it removed nothing at all, against 1 030
     /// counts removed by STAR.
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> abfcf3e (fix(solo): MultiGeneUMI_CR decides ownership on corrected UMIs)
     /// STAR's second condition: the winner on *corrected* UMIs must also not
     /// be beaten on *uncorrected* ones at the same key
     /// (`SoloFeature_collapseUMIall.cpp:226-232`). Correction can move reads
@@ -2664,11 +2657,6 @@ mod tests {
         );
     }
 
-<<<<<<< HEAD
-=======
->>>>>>> 51304b5 (fix(solo): MultiGeneUMI_CR gives a tied UMI to nobody, not to everybody)
-=======
->>>>>>> abfcf3e (fix(solo): MultiGeneUMI_CR decides ownership on corrected UMIs)
     #[test]
     fn multi_gene_umi_cr_drops_a_tie_entirely() {
         let mut tied = HashMap::default();

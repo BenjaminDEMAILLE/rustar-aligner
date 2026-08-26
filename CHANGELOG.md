@@ -21,9 +21,6 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Features
 
-<<<<<<< HEAD
-<<<<<<< HEAD
-<<<<<<< HEAD
 - **CLI and output parity: SAM/SJ/read-input knobs and the STAR limit
   surface** — 30 further STAR 2.7.11b parameters. (`--outSAMorder` came from #145.)
 
@@ -47,9 +44,6 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 - Read names are cut at `--readNameSeparator` (default `/`), as STAR does. A
   read named `foo/1` was previously emitted as `foo/1` where STAR emits `foo`.
-=======
-=======
-=======
 - `--soloOutLayout CellRanger` writes the solo matrices in the shape
   `cellranger count` produces: `outs/raw_feature_bc_matrix/` and
   `outs/filtered_feature_bc_matrix/`, gzipped, with a `-1` GEM-well suffix
@@ -59,20 +53,17 @@ Sections commonly used: Features, Bug fixes, Other changes.
   unchanged. It is the default on 10x geometry, which **changes where
   output files are written** on those runs; see `DIVERGENCE.md` §3.3.
 
->>>>>>> df2253a (feat(solo): --soloOutLayout CellRanger, CellRanger's output shape)
 - On 10x geometry (`CB_UMI_Simple`, a whitelist, 16 bp CB, 10 or 12 bp
   UMI), the five CellRanger-matching flags now **default** to their
   CellRanger values. Any flag named on the command line wins, and the
   substitution is logged. **This changes default output on 10x runs** and
   diverges from STARsolo; see `DIVERGENCE.md` §1.3.
 
->>>>>>> 9f823e2 (feat(solo): CellRanger behaviour by default on 10x geometry)
 - `--soloOutRawBarcodes Observed` writes the raw matrix with one column
   per *observed* barcode instead of one per whitelist barcode, matching
   what CellRanger's `raw_feature_bc_matrix` contains. Counts are
   unchanged; on a 200-cell run `barcodes.tsv` goes from 62 MB to 3.4 kB.
   **Not a STAR parameter**; default `Whitelist` keeps STARsolo behaviour.
->>>>>>> a8f774e (feat(solo): --soloOutRawBarcodes Observed, for a CellRanger-shaped raw matrix)
 
 - **STARsolo single-cell quantification (`--soloType`)** — the 10x
   Chromium / plate-based count-matrix pipeline, ported from STAR and
@@ -201,26 +192,20 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Bug fixes
 
-<<<<<<< HEAD
 - `--runThreadN 1` ran on every logical core instead of on one. The
   rayon pool was configured only above 1, and skipping it leaves rayon's
   default of one worker per core. Output is unchanged; the run now uses
   the thread count asked for.
-=======
->>>>>>> df80683 (docs(changelog): record the MultiGeneUMI_CR tie fix)
 - `--soloUMIfiltering MultiGeneUMI_CR` kept every gene tied at the
   highest read count; CellRanger gives a tied UMI to no gene at all.
   Since one read per gene is the ordinary shape of a multi-gene UMI, the
   flag removed nothing in practice. On a 20k-read 10x fixture the count
   matrix moves from 16 465 to 15 414 against STAR's 15 423.
-<<<<<<< HEAD
 - `--soloUMIfiltering MultiGeneUMI_All` was aliased to `MultiGeneUMI`,
   which is neither STAR's behaviour nor the documented one: in STAR
   2.7.11b the variant is a no-op. It now removes a UMI seen in two or
   more genes from **all** of them, the behaviour the option name
   describes. Recorded in `DIVERGENCE.md` (closes #144).
-=======
->>>>>>> df80683 (docs(changelog): record the MultiGeneUMI_CR tie fix)
 
 - **STARsolo `Gene` assignment now requires exon concordance**, matching
   STARsolo: a read counts toward a gene only when every aligned block

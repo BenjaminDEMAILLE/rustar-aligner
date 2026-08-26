@@ -99,8 +99,6 @@ On the 10k yeast PE benchmark, 4 reads differ in alignment score (AS) because ST
 
 ---
 
-<<<<<<< HEAD
-<<<<<<< HEAD
 ### 3.2 `CellReads.stats` row order
 
 **What STAR does.** `--soloCellReadStats CB` emits its rows by iterating a libc++ `std::unordered_map`, so the order is a hash-table walk rather than a sort. At the map sizes this produces, libc++ chains new entries at the head of their bucket and walks buckets in order, which comes out as the reverse of each barcode's first appearance in read order.
@@ -112,8 +110,6 @@ On the 10k yeast PE benchmark, 4 reads differ in alignment score (AS) because ST
 **Impact.** Past libc++'s load factor the map rehashes, and the order then depends on the bucket count, which depends on how many distinct barcodes were seen; beyond that size the order diverges. The **values never do** — only which line they appear on. Reading the file by barcode rather than by position is unaffected either way.
 
 **Source.** `src/solo/cell_reads.rs`, locked by `rows_are_emitted_in_reverse_first_appearance_order`. STAR: `SoloFeature_statsOutput.cpp`.
-=======
-=======
 ### 1.3 CellRanger behaviour is the default on 10x geometry
 
 **What STAR does.** STARsolo's defaults are its own (`1MM_multi`,
@@ -145,7 +141,6 @@ CellRanger 4.x and 5.x results".
 
 ---
 
->>>>>>> 9f823e2 (feat(solo): CellRanger behaviour by default on 10x geometry)
 ### 3.2 `--soloOutRawBarcodes Observed` (opt-in, non-STAR)
 
 **What STAR does.** STARsolo's raw matrix has one column per whitelist
@@ -170,7 +165,6 @@ untouched.
 **Source.** `src/solo/count.rs` (`observed_barcodes`), `src/params/mod.rs`
 (`solo_out_raw_barcodes`). CellRanger: `outs/raw_feature_bc_matrix/` from a
 `cellranger count` run, observed directly rather than taken from its source.
->>>>>>> a8f774e (feat(solo): --soloOutRawBarcodes Observed, for a CellRanger-shaped raw matrix)
 
 ---
 
