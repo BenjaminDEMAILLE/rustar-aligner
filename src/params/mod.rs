@@ -763,10 +763,6 @@ pub struct Parameters {
     #[arg(long = "outTmpKeep", default_value = "None")]
     pub out_tmp_keep: String,
 
-    /// Number of bins used when sorting BAM by coordinate.
-    #[arg(long = "outBAMsortingBinsN", default_value_t = 50)]
-    pub out_bam_sorting_bins_n: usize,
-
     /// Threads used for BAM sorting. 0 selects `--runThreadN`.
     #[arg(long = "outBAMsortingThreadN", default_value_t = 0)]
     pub out_bam_sorting_thread_n: usize,
