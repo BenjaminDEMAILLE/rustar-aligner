@@ -2284,6 +2284,17 @@ fn apply_cellranger_defaults_on_10x(params: &mut Parameters, matches: &clap::Arg
         if given(id) {
             continue;
         }
+        // MultiGeneUMI_CR decides ownership from the corrected-UMI map that
+        // only the CellRanger dedup builds, and STAR refuses the pair
+        // otherwise. So when the user has picked a different dedup, this
+        // default stays out of the way rather than composing into a
+        // combination the validation then rejects.
+        if id == "solo_umi_filtering"
+            && given("solo_umi_dedup")
+            && params.solo_umi_dedup.first().map(String::as_str) != Some("1MM_CR")
+        {
+            continue;
+        }
         match id {
             "clip_adapter_type" => params.clip_adapter_type = value.to_string(),
             "out_filter_score_min" => params.out_filter_score_min = 30,
@@ -3324,6 +3335,15 @@ mod tests {
             "genes.gtf",
             "--soloCBwhitelist",
             "wl.txt",
+            // Deliberately not 10x geometry: on a 10x run this build defaults
+            // the dedup to 1MM_CR, which would satisfy the rule on its own and
+            // hide what this test is about (see the 10x case at the end).
+            "--soloCBlen",
+            "12",
+            "--soloUMIlen",
+            "8",
+            "--soloUMIstart",
+            "13",
             "--soloUMIfiltering",
             "MultiGeneUMI_CR",
         ];
@@ -3344,6 +3364,24 @@ mod tests {
         let mut multi = base.to_vec();
         multi.extend_from_slice(&["--soloUMIdedup", "1MM_CR", "Exact"]);
         assert!(try_parse(&multi).is_err());
+
+        // On 10x geometry the CellRanger defaults supply 1MM_CR themselves, so
+        // the same flags are accepted rather than refused.
+        let tenx = [
+            "--readFilesIn",
+            "cdna.fq",
+            "bc.fq",
+            "--soloType",
+            "CB_UMI_Simple",
+            "--sjdbGTFfile",
+            "genes.gtf",
+            "--soloCBwhitelist",
+            "wl.txt",
+            "--soloUMIfiltering",
+            "MultiGeneUMI_CR",
+        ];
+        let p = try_parse(&tenx).expect("10x defaults supply the CellRanger dedup");
+        assert_eq!(p.solo_umi_dedup, vec!["1MM_CR".to_string()]);
 
         // The pairing rule applies only to MultiGeneUMI_CR.
         assert!(
