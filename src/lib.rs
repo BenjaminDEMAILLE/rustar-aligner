@@ -737,7 +737,11 @@ fn run_single_pass(
                     if let Some(parent) = output_path.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
-                    Box::new(SamWriter::create(&output_path, index.output_genome(), params)?)
+                    Box::new(SamWriter::create(
+                        &output_path,
+                        index.output_genome(),
+                        params,
+                    )?)
                 }
                 OutSamFormat::Bam => {
                     let sorted = out_type.sort_order == Some(OutSamSortOrder::SortedByCoordinate);
@@ -757,7 +761,11 @@ fn run_single_pass(
                             params,
                         )?)
                     } else {
-                        Box::new(BamWriter::create(&output_path, index.output_genome(), params)?)
+                        Box::new(BamWriter::create(
+                            &output_path,
+                            index.output_genome(),
+                            params,
+                        )?)
                     }
                 }
                 OutSamFormat::None => {

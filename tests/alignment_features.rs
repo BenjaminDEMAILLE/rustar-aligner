@@ -2205,7 +2205,6 @@ fn test_read_name_separator_cuts_the_qname_and_is_configurable() {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // --genomeTransformOutput SAM — alignments reported in original coordinates
 // ---------------------------------------------------------------------------
