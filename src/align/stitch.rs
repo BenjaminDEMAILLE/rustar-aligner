@@ -207,6 +207,10 @@ fn extend_alignment(
     }
 
     let genome_offset = if is_reverse { index.genome.n_genome } else { 0 };
+    // Resolve the genome storage once: both extension loops below read one base
+    // per iteration, and `Genome::get_base` re-checks the `GenomeSeq` variant on
+    // every call.
+    let seq = index.genome.sequence.view();
 
     // --alignEndsType end-to-end extension (STAR extendAlign.cpp, extendToEnd==true):
     // force extension over the entire remaining read, scoring +1 match / -1 mismatch
@@ -246,13 +250,14 @@ fn extend_alignment(
                 }
                 genome_start - 1 - i as u64
             };
-            let Some(genome_base) = index.genome.get_base(genome_pos + genome_offset) else {
+            let genome_base = seq.base((genome_pos + genome_offset) as usize);
+            if genome_base == crate::genome::OUT_OF_RANGE {
                 return ExtendResult {
                     extend_len: 0,
                     max_score: EXTEND_TO_END_KILL,
                     n_mismatch: n_mm_max + 1,
                 };
-            };
+            }
             // Chromosome boundary: cannot extend to the read end here.
             if genome_base == 5 {
                 return ExtendResult {
@@ -320,9 +325,10 @@ fn extend_alignment(
         };
 
         // Get genome base (with strand offset)
-        let Some(genome_base) = index.genome.get_base(genome_pos + genome_offset) else {
+        let genome_base = seq.base((genome_pos + genome_offset) as usize);
+        if genome_base == crate::genome::OUT_OF_RANGE {
             break;
-        };
+        }
 
         // Stop at chromosome boundary (padding = 5)
         if genome_base == 5 {

@@ -1,5 +1,5 @@
 /// Scoring functions for alignment gaps and splice junctions
-use crate::genome::Genome;
+use crate::genome::{Genome, SeqView};
 use crate::params::Parameters;
 
 /// Alignment scorer with user-defined penalties
@@ -356,6 +356,10 @@ impl AlignmentScorer {
         let g_b_start1 = g_a_end_inc as i64 + del;
 
         let genome_offset: u64 = if is_reverse { n_genome } else { 0 };
+        // Resolve the genome storage once: the three scans below read a base per
+        // iteration, and `Genome::get_base` re-checks the `GenomeSeq` variant on
+        // every one of them.
+        let seq = genome.sequence.view();
 
         // Phase 1: Move LEFT from jR1=1, scoring mismatches
         // Find how far left we need to start scanning
@@ -375,17 +379,15 @@ impl AlignmentScorer {
                 break;
             }
 
-            let g_upstream = genome.get_base(g_up_pos as u64 + genome_offset);
-            let g_downstream = genome.get_base(g_dn_pos as u64 + genome_offset);
+            let g_up = seq.base((g_up_pos as u64 + genome_offset) as usize);
+            let g_dn = seq.base((g_dn_pos as u64 + genome_offset) as usize);
 
-            match (g_upstream, g_downstream) {
-                (Some(g_up), Some(g_dn)) if g_up < 4 && g_dn < 4 => {
-                    if read_base == g_up && read_base != g_dn {
-                        // Moving left costs: this base matches upstream but not downstream
-                        score1 -= 1;
-                    }
-                }
-                _ => break,
+            if g_up >= 4 || g_dn >= 4 {
+                break;
+            }
+            if read_base == g_up && read_base != g_dn {
+                // Moving left costs: this base matches upstream but not downstream
+                score1 -= 1;
             }
 
             if score1 + self.score_stitch_sj_shift < 0 {
@@ -424,18 +426,15 @@ impl AlignmentScorer {
                 let g_dn_pos = g_b_start1 + jr1 as i64;
 
                 if g_up_pos >= 0 && g_dn_pos >= 0 {
-                    let g_up = genome.get_base(g_up_pos as u64 + genome_offset);
-                    let g_dn = genome.get_base(g_dn_pos as u64 + genome_offset);
+                    let gu = seq.base((g_up_pos as u64 + genome_offset) as usize);
+                    let gd = seq.base((g_dn_pos as u64 + genome_offset) as usize);
 
-                    match (g_up, g_dn) {
-                        (Some(gu), Some(gd)) if gu < 4 && gd < 4 => {
-                            if read_base == gu && read_base != gd {
-                                score1 += 1;
-                            } else if read_base != gu && read_base == gd {
-                                score1 -= 1;
-                            }
+                    if gu < 4 && gd < 4 {
+                        if read_base == gu && read_base != gd {
+                            score1 += 1;
+                        } else if read_base != gu && read_base == gd {
+                            score1 -= 1;
                         }
-                        _ => {}
                     }
                 }
             }
@@ -452,10 +451,10 @@ impl AlignmentScorer {
                 };
                 let w = match window.as_mut() {
                     Some(w) => {
-                        w.slide_to(donor_fwd, del as u64, genome);
+                        w.slide_to(donor_fwd, del as u64, seq);
                         &*w
                     }
-                    None => window.insert(MotifWindow::at(donor_fwd, del as u64, genome)),
+                    None => window.insert(MotifWindow::at(donor_fwd, del as u64, seq)),
                 };
                 let motif = w.motif();
                 let motif_score = self.score_splice_junction(motif);
@@ -499,13 +498,12 @@ impl AlignmentScorer {
             if left_pos < 0 || right_pos < 0 {
                 break;
             }
-            let g_left = genome.get_base(left_pos as u64 + genome_offset);
-            let g_right = genome.get_base(right_pos as u64 + genome_offset);
-            match (g_left, g_right) {
-                (Some(gl), Some(gr)) if gl < 4 && gl == gr => {
-                    jj_l += 1;
-                }
-                _ => break,
+            let gl = seq.base((left_pos as u64 + genome_offset) as usize);
+            let gr = seq.base((right_pos as u64 + genome_offset) as usize);
+            if gl < 4 && gl == gr {
+                jj_l += 1;
+            } else {
+                break;
             }
             if jj_l > 255 {
                 break;
@@ -520,13 +518,12 @@ impl AlignmentScorer {
             if left_pos < 0 || right_pos < 0 {
                 break;
             }
-            let g_left = genome.get_base(left_pos as u64 + genome_offset);
-            let g_right = genome.get_base(right_pos as u64 + genome_offset);
-            match (g_left, g_right) {
-                (Some(gl), Some(gr)) if gl < 4 && gl == gr => {
-                    jj_r += 1;
-                }
-                _ => break,
+            let gl = seq.base((left_pos as u64 + genome_offset) as usize);
+            let gr = seq.base((right_pos as u64 + genome_offset) as usize);
+            if gl < 4 && gl == gr {
+                jj_r += 1;
+            } else {
+                break;
             }
             if jj_r > 255 {
                 break;
@@ -605,16 +602,7 @@ impl AlignmentScorer {
 /// `donor_pos` is the 0-based position of the intron's first base on the
 /// forward strand; `intron_len` is the intron length in bases.
 pub fn detect_splice_motif(donor_pos: u64, intron_len: u32, genome: &Genome) -> SpliceMotif {
-    MotifWindow::at(donor_pos, intron_len as u64, genome).motif()
-}
-
-/// A position off the end of the genome. No motif arm matches it, so it falls
-/// through to `NonCanonical` exactly as `get_base` returning `None` did.
-const OUT_OF_RANGE: u8 = u8::MAX;
-
-#[inline]
-fn base_or_out_of_range(genome: &Genome, pos: u64) -> u8 {
-    genome.get_base(pos).unwrap_or(OUT_OF_RANGE)
+    MotifWindow::at(donor_pos, intron_len as u64, genome.sequence.view()).motif()
 }
 
 /// The four bases that decide a splice motif: the intron's first two and last
@@ -634,13 +622,13 @@ struct MotifWindow {
 
 impl MotifWindow {
     #[inline]
-    fn at(donor: u64, intron_len: u64, genome: &Genome) -> Self {
+    fn at(donor: u64, intron_len: u64, seq: SeqView<'_>) -> Self {
         Self {
             donor,
-            d1: base_or_out_of_range(genome, donor),
-            d2: base_or_out_of_range(genome, donor + 1),
-            a1: base_or_out_of_range(genome, donor + intron_len - 2),
-            a2: base_or_out_of_range(genome, donor + intron_len - 1),
+            d1: seq.base(donor as usize),
+            d2: seq.base((donor + 1) as usize),
+            a1: seq.base((donor + intron_len - 2) as usize),
+            a2: seq.base((donor + intron_len - 1) as usize),
         }
     }
 
@@ -651,21 +639,21 @@ impl MotifWindow {
     /// `d1`/`a1` become the new `d2`/`a2`. Any other step is rare enough that
     /// re-reading all four is the simpler answer.
     #[inline]
-    fn slide_to(&mut self, donor: u64, intron_len: u64, genome: &Genome) {
+    fn slide_to(&mut self, donor: u64, intron_len: u64, seq: SeqView<'_>) {
         if donor == self.donor + 1 {
             self.d1 = self.d2;
             self.a1 = self.a2;
-            self.d2 = base_or_out_of_range(genome, donor + 1);
-            self.a2 = base_or_out_of_range(genome, donor + intron_len - 1);
+            self.d2 = seq.base((donor + 1) as usize);
+            self.a2 = seq.base((donor + intron_len - 1) as usize);
             self.donor = donor;
         } else if donor + 1 == self.donor {
             self.d2 = self.d1;
             self.a2 = self.a1;
-            self.d1 = base_or_out_of_range(genome, donor);
-            self.a1 = base_or_out_of_range(genome, donor + intron_len - 2);
+            self.d1 = seq.base(donor as usize);
+            self.a1 = seq.base((donor + intron_len - 2) as usize);
             self.donor = donor;
         } else if donor != self.donor {
-            *self = Self::at(donor, intron_len, genome);
+            *self = Self::at(donor, intron_len, seq);
         }
     }
 
@@ -830,7 +818,7 @@ mod tests {
             }
         }
 
-        let values = [0u8, 1, 2, 3, 4, 5, OUT_OF_RANGE];
+        let values = [0u8, 1, 2, 3, 4, 5, crate::genome::OUT_OF_RANGE];
         for &d1 in &values {
             for &d2 in &values {
                 for &a1 in &values {
