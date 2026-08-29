@@ -127,6 +127,41 @@ pub struct SeqView<'a> {
 pub const OUT_OF_RANGE: u8 = u8::MAX;
 
 impl SeqView<'_> {
+    /// Copy the bases at `[start, start + out.len())` into `out`, returning how
+    /// many were available.
+    ///
+    /// Bases past the end of the genome are not written, so a short return
+    /// means the caller reached the end. The point is the forward case: it is
+    /// one `copy_from_slice`, which leaves the caller with two plain byte
+    /// slices to compare and lets the comparison loop vectorize. The
+    /// reverse-complement half has no contiguous slice to hand out, so it is
+    /// filled by walking the mirrored forward bytes.
+    pub fn bases_into(&self, start: usize, out: &mut [u8]) -> usize {
+        if start < self.rc_from {
+            // Forward strand of a mapped genome, or anywhere in an owned one.
+            let end = (start + out.len()).min(self.buf.len());
+            if start >= end {
+                return 0;
+            }
+            let n = end - start;
+            out[..n].copy_from_slice(&self.buf[start..end]);
+            return n;
+        }
+        let two_n = self.rc_from * 2;
+        if start >= two_n {
+            return 0;
+        }
+        let n = out.len().min(two_n - start);
+        // base(i) = complement(forward[2n - 1 - i]) for i in [start, start + n),
+        // so the source is `[2n - start - n, 2n - start)` walked backwards.
+        let hi = two_n - start;
+        let src = &self.buf[hi - n..hi];
+        for (o, &f) in out[..n].iter_mut().zip(src.iter().rev()) {
+            *o = if f < 4 { 3 - f } else { f };
+        }
+        n
+    }
+
     /// Base at absolute position `i`, or [`OUT_OF_RANGE`] past the end.
     ///
     /// Equivalent to `GenomeSeq::get(i).unwrap_or(OUT_OF_RANGE)`.
