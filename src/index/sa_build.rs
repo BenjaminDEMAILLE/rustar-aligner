@@ -17,7 +17,7 @@
 //!    ext-mem pathologically slow — the in-memory
 //!    [`caps_sa::build_in_memory`] is used instead. Override with
 //!    `RUSTAR_USE_IN_MEM=1` (force in-mem) or `RUSTAR_USE_EXT_MEM={1,0}`
-//!    (force ext-mem on/off); see [`use_ext_mem`] for the full
+//!    (force ext-mem on/off); see [`use_ext_mem_for`] for the full
 //!    decision table.
 //! 3. **Filter + pack.** Each output position from caps-sa is fed into a
 //!    streaming callback that keeps only ACGT (`≤ 3`) starts, applies
@@ -632,7 +632,7 @@ fn dispatch_caps_sa_segmented(
          (text len {n}, {n_seg_runs} non-spacer segments, no spacer-free copy)"
     );
 
-    if use_ext_mem(n) {
+    if use_ext_mem_for(n, original) {
         // The production segmented genome-plus-junction layout contains many
         // long shared contexts across phase-4 partition merges. Enable caps-sa's
         // bounded, partition-local geometric LCP memoization with its measured
@@ -715,7 +715,7 @@ where
 {
     let n2 = original.len();
     let symbol_width = std::mem::size_of::<S>();
-    if use_ext_mem(t_prime.len()) {
+    if use_ext_mem_for(t_prime.len(), original) {
         log::info!(
             "sa_build: invoking caps-sa::build_ext_mem_for_filter \
              (text len {}, {symbol_width}-byte alphabet)",
@@ -777,49 +777,169 @@ fn map_caps_sa_error(err: caps_sa::BuildError<Error>) -> Error {
     }
 }
 
-/// Select the in-memory vs. external-memory caps-sa path.
-///
-/// The external-memory path is the **default for genomes at or above
-/// `EXT_MEM_THRESHOLD_BYTES`**: it streams the SA from disk-spilling
-/// buckets and keeps peak RAM bounded at ~`O(text + n/p)` regardless of
-/// genome size. Below the threshold, the in-memory path is preferred:
-/// it's faster on tiny inputs, and ext-mem becomes pathological when
-/// the transformed text is dominated by `genomeChrBinNbits` padding
-/// (e.g. a 20 kb test fixture rounds to 256 kb of padded text, of which
-/// >90% is constant spacer bytes — `caps-sa` sorts those positions and
-/// > then we filter them out, but the sort itself does `O(spacer_run_len²)`
-/// > work because every spacer-starting suffix shares a near-maximal LCP
-/// > with every other).
-///
-/// Explicit overrides (decision order):
-///
-/// 1. `RUSTAR_USE_IN_MEM=1` (also accepts `true`/`yes`/`on`) forces
-///    in-memory.
-/// 2. `RUSTAR_USE_EXT_MEM=1` / `=0` (also accepts the usual aliases)
-///    forces ext-mem on / off respectively. Retained for backward
-///    compatibility with the earlier opt-in flag.
-///
-/// Without overrides the threshold below decides. 16 MB transformed
-/// text places yeast (~30 MB), human primary chromosomes (~6 MB-200 MB
-/// transformed text per chromosome), and any input where the padded
-/// genome would dwarf in-memory's `~4 × n × sizeof(I)` working set on
-/// the ext-mem path; tiny synthetic test fixtures stay in-memory.
-fn use_ext_mem(text_len: usize) -> bool {
+/// Transformed-text size at or above which ext-mem is the default path.
+const EXT_MEM_THRESHOLD_BYTES: usize = 16 * 1024 * 1024;
+
+/// The `RUSTAR_USE_IN_MEM` / `RUSTAR_USE_EXT_MEM` overrides, if either is set.
+fn ext_mem_env_override() -> Option<bool> {
     if let Ok(v) = std::env::var("RUSTAR_USE_IN_MEM")
         && matches!(v.as_str(), "1" | "true" | "yes" | "on")
     {
-        return false;
+        return Some(false);
     }
     if let Ok(v) = std::env::var("RUSTAR_USE_EXT_MEM") {
         if matches!(v.as_str(), "0" | "false" | "no" | "off") {
-            return false;
+            return Some(false);
         }
         if matches!(v.as_str(), "1" | "true" | "yes" | "on") {
-            return true;
+            return Some(true);
         }
     }
-    const EXT_MEM_THRESHOLD_BYTES: usize = 16 * 1024 * 1024;
-    text_len >= EXT_MEM_THRESHOLD_BYTES
+    None
+}
+
+/// Choose the SA construction path, allowing a tandem-repeat-heavy genome that
+/// comfortably fits in RAM to take the in-memory path instead of ext-mem.
+///
+/// Both paths produce a byte-identical index (verified on the satellite genome
+/// below: `SA`, `SAindex`, `Genome` and `chrStart.txt` all compare equal), so
+/// this is purely a speed choice and can never change results.
+///
+/// The reason it is worth making: caps-sa sorts suffixes by comparison, so a
+/// comparison costs O(LCP), and a tandem array makes LCPs enormous. The two
+/// paths degrade very differently there. On a 40 MB genome carrying a 3 MB
+/// exact 171-base tandem array (8% of the genome, which is roughly what human
+/// alpha-satellite looks like), ext-mem takes 52.5s and in-memory 27.7s. On the
+/// same genome without the array, ext-mem is the faster of the two (4.8s vs
+/// 6.7s) and uses a fraction of the memory, so this is an escape hatch for the
+/// repetitive case and not a new default.
+///
+/// In-memory peaks at roughly 68x the text (measured: 67.2x and 67.9x on 40 MB
+/// and 37 MB inputs) against ext-mem's ~8x, so it is only taken when that
+/// footprint fits well inside RAM. A genome large enough to matter at human
+/// scale will not fit and stays on ext-mem; the pathology is real there too,
+/// but it needs an upstream fix in caps-sa rather than a routing decision here.
+fn use_ext_mem_for(text_len: usize, genome: &[u8]) -> bool {
+    if let Some(forced) = ext_mem_env_override() {
+        return forced;
+    }
+    if text_len < EXT_MEM_THRESHOLD_BYTES {
+        return false;
+    }
+    if in_memory_footprint_fits(text_len) {
+        let score = tandem_repeat_score(genome);
+        if score >= TANDEM_REPEAT_MIN_SCORE {
+            log::info!(
+                "sa_build: tandem-repeat score {score:.3} >= {TANDEM_REPEAT_MIN_SCORE} and the \
+                 in-memory working set fits; using the in-memory SA path (same index, faster \
+                 on this input)"
+            );
+            return false;
+        }
+    }
+    true
+}
+
+/// Sampled positions whose 32-mer recurs at least this often *within the
+/// sample* before the genome counts as tandem-repeat heavy.
+///
+/// Measured separation is wide: the 3-copy 1%-divergent genome scores 0.0000
+/// and the same genome plus a 3 MB tandem array scores 0.0764. Divergent
+/// repeats do not register, because two copies of a locus rarely both land in
+/// the sample; a tandem array does, because its whole span collapses onto a
+/// handful of distinct k-mers.
+const TANDEM_REPEAT_MIN_SCORE: f64 = 0.02;
+
+/// Peak in-memory working set as a multiple of the text length. Measured at
+/// 67.2x and 67.9x; rounded up for headroom.
+const IN_MEMORY_TEXT_MULTIPLE: u64 = 72;
+
+/// Share of total RAM the in-memory path is allowed to occupy.
+const IN_MEMORY_RAM_SHARE: u64 = 40;
+
+/// Whether the in-memory path's working set fits comfortably in RAM.
+///
+/// Conservative by construction: if the total cannot be determined, the answer
+/// is no and the caller stays on the bounded-memory path.
+fn in_memory_footprint_fits(text_len: usize) -> bool {
+    let Some(total) = total_ram_bytes() else {
+        return false;
+    };
+    let needed = (text_len as u64).saturating_mul(IN_MEMORY_TEXT_MULTIPLE);
+    needed <= total / 100 * IN_MEMORY_RAM_SHARE
+}
+
+/// Total physical RAM, or `None` if it cannot be determined on this platform.
+fn total_ram_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+        for line in meminfo.lines() {
+            if let Some(rest) = line.strip_prefix("MemTotal:") {
+                let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+                return Some(kb * 1024);
+            }
+        }
+        None
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut out: u64 = 0;
+        let mut len = std::mem::size_of::<u64>();
+        // SAFETY: `hw.memsize` is a u64 sysctl; `out`/`len` are sized for it.
+        let rc = unsafe {
+            libc::sysctlbyname(
+                c"hw.memsize".as_ptr(),
+                std::ptr::from_mut(&mut out).cast(),
+                std::ptr::from_mut(&mut len),
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        (rc == 0).then_some(out)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+/// Fraction of sampled positions whose 32-mer recurs at least 8 times within
+/// the sample: a cheap proxy for "this genome contains long tandem arrays".
+///
+/// Sampling is seeded from a constant so the path decision is deterministic for
+/// a given genome. Positions containing anything but A/C/G/T are skipped, and
+/// the walk is bounded so a genome that is mostly `N` cannot spin.
+fn tandem_repeat_score(genome: &[u8]) -> f64 {
+    use rustc_hash::FxHashMap;
+
+    const K: usize = 32;
+    const SAMPLES: usize = 200_000;
+    const HEAVY: u32 = 8;
+
+    if genome.len() <= K {
+        return 0.0;
+    }
+    let span = genome.len() - K;
+    // A fixed odd stride walks the genome without clustering, and without
+    // needing an RNG or any allocation beyond the counter map.
+    let stride = ((span / SAMPLES.max(1)) | 1).max(1);
+    let mut counts: FxHashMap<&[u8], u32> = FxHashMap::default();
+    let mut taken = 0usize;
+    let mut pos = 0usize;
+    while taken < SAMPLES && pos < span {
+        let w = &genome[pos..pos + K];
+        if w.iter().all(|&b| b < 4) {
+            *counts.entry(w).or_insert(0) += 1;
+            taken += 1;
+        }
+        pos += stride;
+    }
+    if taken == 0 {
+        return 0.0;
+    }
+    let heavy: u32 = counts.values().filter(|&&v| v >= HEAVY).sum();
+    f64::from(heavy) / taken as f64
 }
 
 /// Count the maximal runs of spacer bytes (value `5`) in `genome`.
@@ -1194,5 +1314,68 @@ mod tests {
             ">chr1\nACGTNNNACGTNNNACGTNNN\n>chr2\nNNNACGT\n",
             5,
         );
+    }
+
+    /// A tandem array collapses onto a handful of distinct k-mers, so almost
+    /// every sampled position lands on a heavily repeated one; pseudo-random
+    /// sequence has essentially no within-sample collisions. The routing
+    /// threshold sits between the two with a wide margin either side.
+    #[test]
+    fn tandem_repeat_score_separates_arrays_from_random_sequence() {
+        // Deterministic pseudo-random bases, no RNG dependency.
+        let mut x: u64 = 0x243f_6a88_85a3_08d3;
+        let random: Vec<u8> = (0..2_000_000u32)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                ((x >> 33) & 3) as u8
+            })
+            .collect();
+        let random_score = tandem_repeat_score(&random);
+        assert!(
+            random_score < TANDEM_REPEAT_MIN_SCORE,
+            "random sequence scored {random_score}"
+        );
+
+        // A 171-base monomer tiled to the same length, as in a satellite array.
+        let monomer: Vec<u8> = random[..171].to_vec();
+        let array: Vec<u8> = monomer.iter().copied().cycle().take(2_000_000).collect();
+        let array_score = tandem_repeat_score(&array);
+        assert!(
+            array_score > TANDEM_REPEAT_MIN_SCORE,
+            "tandem array scored {array_score}"
+        );
+    }
+
+    /// Non-ACGT bytes are skipped, so an all-`N` genome yields no samples at
+    /// all rather than spinning or dividing by zero.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn tandem_repeat_score_handles_degenerate_input() {
+        // Exact zero is the documented return for each of these, so an exact
+        // comparison is the assertion that means something here.
+        assert_eq!(tandem_repeat_score(&[]), 0.0);
+        assert_eq!(tandem_repeat_score(&[0u8; 8]), 0.0); // shorter than K
+        let all_n = vec![4u8; 100_000];
+        assert_eq!(tandem_repeat_score(&all_n), 0.0); // no ACGT window anywhere
+    }
+
+    /// The memory guard is what keeps a genome that cannot afford the
+    /// in-memory path from taking it. A petabyte of text never fits.
+    #[test]
+    fn in_memory_footprint_rejects_oversized_text() {
+        assert!(!in_memory_footprint_fits(usize::MAX / 128));
+    }
+
+    /// Both explicit overrides still win over the routing heuristic. Checked
+    /// through the pure helper rather than by mutating the environment, which
+    /// would race with the other tests in this binary.
+    #[test]
+    fn env_override_absent_by_default() {
+        // The test binary sets neither variable, so routing is in charge.
+        assert_eq!(ext_mem_env_override(), None);
+        // Below the threshold the decision is in-memory regardless of content.
+        assert!(!use_ext_mem_for(1024, &[0u8; 1024]));
     }
 }

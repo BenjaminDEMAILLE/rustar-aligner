@@ -980,6 +980,7 @@ dependencies = [
  "dashmap",
  "env_logger",
  "flate2",
+ "libc",
  "libdeflater",
  "libmimalloc-sys",
  "log",

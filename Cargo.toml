@@ -41,6 +41,9 @@ bstr = "1"
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 rayon = "1"
 rustc-hash = "2"
+# libc for `sysctlbyname("hw.memsize")` on macOS, used by the SA-path memory
+# budget in index/sa_build.rs. Already in the tree transitively.
+libc = "0.2"
 dashmap = "6"
 chrono = "0.4"
 tempfile = "3"
