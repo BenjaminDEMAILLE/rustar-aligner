@@ -1159,6 +1159,41 @@ pub(crate) struct WorkingTranscript {
 }
 
 impl WorkingTranscript {
+    /// Clone, leaving room for the one element the stitcher is about to push.
+    ///
+    /// `Vec::clone` allocates exactly `len`, so the push that always follows
+    /// this clone in `stitch_align_to_transcript` reallocates every time: a
+    /// malloc, a copy and a free per stitched seed. Reserving the slot up
+    /// front folds that back into the clone's own allocation.
+    ///
+    /// The junction vectors only get headroom when they already hold
+    /// something. Most transcripts carry no junction at all, and giving an
+    /// empty vector capacity would allocate for a push that never comes,
+    /// which is worse than what it replaces.
+    fn clone_with_headroom(&self) -> Self {
+        fn grown<T: Clone>(v: &[T], extra: usize) -> Vec<T> {
+            let mut out = Vec::with_capacity(v.len() + extra);
+            out.extend_from_slice(v);
+            out
+        }
+        let junction_extra = usize::from(!self.junction_motifs.is_empty());
+        WorkingTranscript {
+            exons: grown(&self.exons, 1),
+            junction_motifs: grown(&self.junction_motifs, junction_extra),
+            junction_annotated: grown(&self.junction_annotated, junction_extra),
+            junction_shifts: grown(&self.junction_shifts, junction_extra),
+            score: self.score,
+            n_mismatch: self.n_mismatch,
+            n_gap: self.n_gap,
+            n_junction: self.n_junction,
+            n_anchor: self.n_anchor,
+            read_start: self.read_start,
+            read_end: self.read_end,
+            genome_start: self.genome_start,
+            genome_end: self.genome_end,
+        }
+    }
+
     fn new() -> Self {
         WorkingTranscript {
             exons: Vec::new(),
@@ -1252,7 +1287,7 @@ fn stitch_align_to_transcript(
         if align_mates_gap_max > 0 && genome_gap > align_mates_gap_max {
             return None;
         }
-        let mut new_wt = wt.clone();
+        let mut new_wt = wt.clone_with_headroom();
 
         // STAR stitchAlignToTranscript.cpp:374-381: right-extend mate A to fragment boundary.
         // extendAlign(R, G, rAend+1, gAend+1, 1, 1, DEF_readSeqLengthMax, nMatch, nMM, ...)
@@ -1377,7 +1412,7 @@ fn stitch_align_to_transcript(
         return None;
     }
 
-    let mut new_wt = wt.clone();
+    let mut new_wt = wt.clone_with_headroom();
     let mut d_score: i32 = 0;
     let mut gap_mm: u32 = 0;
 
