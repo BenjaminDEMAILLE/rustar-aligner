@@ -73,6 +73,21 @@ pub struct SortedBamWriter {
     limit_bam_sort_ram: u64,
     /// `--outBAMsortingBinsN`. 0 sorts entirely in memory.
     bins_n: usize,
+    /// Open bin files, once the buffer has first crossed the RAM bound.
+    ///
+    /// Held across `write_batch` calls so records can be pushed out as they
+    /// arrive rather than accumulating until `finish`.
+    spill: Option<SpillState>,
+}
+
+/// The on-disk bins a spilling sort writes into, kept open between batches.
+struct SpillState {
+    /// Dropping this removes the bin files; it is never read directly.
+    _dir: tempfile::TempDir,
+    paths: Vec<std::path::PathBuf>,
+    writers: Vec<bam::io::Writer<bgzf::io::Writer<BufWriter<File>>>>,
+    bins: usize,
+    n_refs: usize,
 }
 
 impl BamWriter {
@@ -158,6 +173,7 @@ impl SortedBamWriter {
             compression: params.out_bam_compression,
             limit_bam_sort_ram: params.limit_bam_sort_ram,
             bins_n: params.out_bam_sorting_bins_n,
+            spill: None,
         })
     }
 
@@ -185,39 +201,23 @@ impl SortedBamWriter {
     /// the sort, so peak usage is the largest bin rather than the whole run.
     /// Unmapped records sort after everything else and get the last bin.
     fn finish_binned(&mut self) -> Result<(), Error> {
-        let n_refs = self.header.reference_sequences().len().max(1);
-        let bins = self.bins_n.min(n_refs).max(1);
-        let bin_of = |rec: &RecordBuf| -> usize {
-            match rec.reference_sequence_id() {
-                Some(chr) => (chr * bins) / n_refs,
-                None => bins, // the unmapped tail
-            }
-        };
-
-        let dir = tempfile::tempdir().map_err(|e| Error::io(e, &self.output_path))?;
-        let paths: Vec<std::path::PathBuf> = (0..=bins)
-            .map(|i| dir.path().join(format!("bin{i}.bam")))
-            .collect();
-
-        // Pass 1: stream every buffered record out to its bin, dropping it from
-        // memory as we go. Uncompressed, since these files are read back
-        // immediately and compressing them would be pure cost.
+        // Pass 1: whatever is still buffered joins what was already spilled,
+        // then the bin files are closed. When the bound was crossed during the
+        // run these writers are already open and mostly written.
+        self.spill_buffered()?;
+        let mut spill = self.spill.take().expect("spill_buffered opens it");
         {
-            let mut writers: Vec<bam::io::Writer<bgzf::io::Writer<BufWriter<File>>>> = Vec::new();
-            for path in &paths {
-                let f = File::create(path).map_err(|e| Error::io(e, path))?;
-                let mut bgzf = make_bgzf_writer(BufWriter::new(f), 0);
-                write_bam_header_lenient(&mut bgzf, &self.header, None)?;
-                writers.push(bam::io::Writer::from(bgzf));
-            }
-            for rec in self.records.drain(..) {
-                let b = bin_of(&rec);
-                writers[b].write_alignment_record(&self.header, &rec)?;
-            }
-            for w in &mut writers {
-                w.finish(&self.header)?;
-            }
+            let header = std::mem::take(&mut self.header);
+            let result = spill
+                .writers
+                .iter_mut()
+                .try_for_each(|w| w.finish(&header).map_err(Error::from));
+            self.header = header;
+            result?;
         }
+        let paths = std::mem::take(&mut spill.paths);
+        let bins = spill.bins;
+        drop(spill.writers);
 
         // Pass 2: one bin at a time.
         let buf_writer = BufWriter::new(File::create(&self.output_path)?);
@@ -255,15 +255,80 @@ impl SortedBamWriter {
         Ok(())
     }
 
-    /// Buffer records — no disk I/O yet.
+    /// Buffer records, pushing them out to bins once the bound is crossed.
+    ///
+    /// Checking only at `finish` would let every record accumulate first, so
+    /// the peak would be the whole run no matter how the sort was then
+    /// performed. The bound has to be enforced while records arrive.
     pub fn write_batch(&mut self, batch: &[RecordBuf]) -> Result<(), Error> {
         self.records.extend_from_slice(batch);
+        if self.should_spill() {
+            self.spill_buffered()?;
+        }
         Ok(())
     }
 
     /// Estimate memory used by buffered records (rough: 400 bytes/record for 150bp reads).
     fn estimated_ram(&self) -> u64 {
         self.records.len() as u64 * 400
+    }
+
+    /// Which bin a record belongs to. Unmapped records take the last one.
+    fn bin_index(rec: &RecordBuf, bins: usize, n_refs: usize) -> usize {
+        match rec.reference_sequence_id() {
+            Some(chr) => (chr * bins) / n_refs,
+            None => bins,
+        }
+    }
+
+    /// Open the bin files. Called the first time the buffer crosses the bound.
+    fn open_spill(&mut self) -> Result<(), Error> {
+        if self.spill.is_some() {
+            return Ok(());
+        }
+        let n_refs = self.header.reference_sequences().len().max(1);
+        let bins = self.bins_n.min(n_refs).max(1);
+        let dir = tempfile::tempdir().map_err(|e| Error::io(e, &self.output_path))?;
+        let paths: Vec<std::path::PathBuf> = (0..=bins)
+            .map(|i| dir.path().join(format!("bin{i}.bam")))
+            .collect();
+        let mut writers = Vec::with_capacity(paths.len());
+        for path in &paths {
+            let f = File::create(path).map_err(|e| Error::io(e, path))?;
+            // Uncompressed: these are read back immediately, so compressing
+            // them would cost time and save nothing.
+            let mut bgzf = make_bgzf_writer(BufWriter::new(f), 0);
+            write_bam_header_lenient(&mut bgzf, &self.header, None)?;
+            writers.push(bam::io::Writer::from(bgzf));
+        }
+        self.spill = Some(SpillState {
+            _dir: dir,
+            paths,
+            writers,
+            bins,
+            n_refs,
+        });
+        Ok(())
+    }
+
+    /// Move everything currently buffered out to its bin, freeing the buffer.
+    fn spill_buffered(&mut self) -> Result<(), Error> {
+        self.open_spill()?;
+        // `records` is moved aside so the spill state can be borrowed mutably
+        // while draining it; the emptied allocation goes back afterwards.
+        let mut records = std::mem::take(&mut self.records);
+        let header = std::mem::take(&mut self.header);
+        let result = (|| -> Result<(), Error> {
+            let spill = self.spill.as_mut().expect("opened above");
+            for rec in records.drain(..) {
+                let b = Self::bin_index(&rec, spill.bins, spill.n_refs);
+                spill.writers[b].write_alignment_record(&header, &rec)?;
+            }
+            Ok(())
+        })();
+        self.header = header;
+        self.records = records;
+        result
     }
 
     fn check_ram_limit(&self) -> Result<(), Error> {
@@ -290,7 +355,7 @@ impl SortedBamWriter {
         // Spilling keeps only one bin's worth of records resident at a time, so
         // `--limitBAMsortRAM` becomes a bound the sort respects rather than a
         // threshold it dies on.
-        if self.should_spill() {
+        if self.spill.is_some() || self.should_spill() {
             return self.finish_binned();
         }
         self.check_ram_limit()?;
