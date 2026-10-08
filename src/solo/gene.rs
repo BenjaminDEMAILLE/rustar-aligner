@@ -650,7 +650,7 @@ mod tests {
         let far = vec![read_at(900, 950, false)];
         let out = align_genes(&far, &ann, SoloStrand::Forward, SoloFeature::Gene);
         assert_eq!(out.ov_type, OverlapType::Intergenic as i32);
-        assert!(out.gene_set.is_empty());
+        assert_eq!(out.gene_set.len(), 0);
     }
 
     /// A read inside an intron is intronic-sense, and carries the gene only on

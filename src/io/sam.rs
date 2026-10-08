@@ -28,18 +28,21 @@ use std::io::BufWriter;
 use std::num::NonZeroUsize;
 use std::path::Path;
 
-/// Buffer for SAM records built by parallel threads
+/// Per-read buffer of SAM records built by the parallel alignment workers.
+///
+/// One buffer is created for every read (or read pair), and it usually holds
+/// only 1 to a few records (primary plus any secondaries), so it starts empty
+/// and grows on demand. There is no batch-level merge: the writer consumes
+/// each read's buffer in order.
 #[derive(Default)]
 pub struct BufferedSamRecords {
     pub records: Vec<RecordBuf>,
 }
 
 impl BufferedSamRecords {
-    /// Create new buffer with capacity
+    /// Create an empty per-read buffer (no up-front allocation).
     pub fn new() -> Self {
-        Self {
-            records: Vec::with_capacity(10000),
-        }
+        Self::default()
     }
 
     /// Add a record to the buffer
@@ -1247,42 +1250,42 @@ pub fn add_solo_read_index(records: &mut [RecordBuf], read_index: u32) {
     }
 }
 
-/// Replace the private read-index tag with `CB`/`UB`, read out of STAR's
-/// readInfo once UMI collapsing has run.
+/// Replace a record's private read-index tag with `CB`/`UB`, read out of
+/// STAR's readInfo once UMI collapsing has run.
 ///
 /// Both tags are written whenever either was requested, and both fall back to
 /// `"-"`, exactly as `SoloFeature::addBAMtags` does: a read that was not counted
 /// (no whitelist cell, no valid UMI, no gene) has no cell or molecule to name.
 pub fn apply_solo_read_info(
-    records: &mut [RecordBuf],
+    rec: &mut RecordBuf,
     read_info: &[crate::solo::ReadInfo],
     whitelist: &crate::solo::CbWhitelist,
     umi_len: usize,
 ) {
     let tag = Tag::new(SOLO_READ_INDEX_TAG[0], SOLO_READ_INDEX_TAG[1]);
-    for rec in records.iter_mut() {
-        let Some(Value::UInt32(read_index)) = rec.data().get(&tag).cloned() else {
-            continue;
-        };
-        rec.data_mut().remove(&tag);
-        let info = read_info
-            .get(read_index as usize)
-            .copied()
-            .unwrap_or_default();
-        let cb = (info.cb != u32::MAX)
-            .then(|| whitelist.barcode_string(info.cb))
-            .flatten()
-            .unwrap_or_else(|| "-".to_string());
-        let ub = if info.umi == u64::MAX {
-            "-".to_string()
-        } else {
-            crate::solo::whitelist::unpack_barcode(info.umi, umi_len)
-        };
-        rec.data_mut()
-            .insert(Tag::new(b'C', b'B'), Value::String(BString::from(cb)));
-        rec.data_mut()
-            .insert(Tag::new(b'U', b'B'), Value::String(BString::from(ub)));
-    }
+    // Read back as any integer: a record that went through a spill run is
+    // re-decoded from BAM, which need not keep the in-memory value type.
+    let Some(read_index) = rec.data().get(&tag).and_then(Value::as_int) else {
+        return;
+    };
+    rec.data_mut().remove(&tag);
+    let info = read_info
+        .get(read_index as usize)
+        .copied()
+        .unwrap_or_default();
+    let cb = (info.cb != u32::MAX)
+        .then(|| whitelist.barcode_string(info.cb))
+        .flatten()
+        .unwrap_or_else(|| "-".to_string());
+    let ub = if info.umi == u64::MAX {
+        "-".to_string()
+    } else {
+        crate::solo::whitelist::unpack_barcode(info.umi, umi_len)
+    };
+    rec.data_mut()
+        .insert(Tag::new(b'C', b'B'), Value::String(BString::from(cb)));
+    rec.data_mut()
+        .insert(Tag::new(b'U', b'B'), Value::String(BString::from(ub)));
 }
 
 /// Apply `--outSAMflagOR` / `--outSAMflagAND` to a mapped record's FLAG:
@@ -2062,7 +2065,7 @@ mod tests {
             .get(&program_tag::COMMAND_LINE)
             .expect("CL field must be present even when command_line is None")
             .as_ref();
-        assert!(!cl.is_empty());
+        assert_ne!(cl, []);
     }
 
     #[test]

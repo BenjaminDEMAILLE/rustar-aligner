@@ -108,6 +108,8 @@ fn genome_generate(params: &Parameters) -> anyhow::Result<()> {
         );
     }
 
+    let time_start = chrono::Local::now();
+
     info!("Building genome index (streaming SA + on-the-fly SAindex)...");
     // Streaming path: opens SA file early, packs each caps-sa emit
     // directly to disk + into the SAindex builder, never holding the
@@ -137,6 +139,29 @@ fn genome_generate(params: &Parameters) -> anyhow::Result<()> {
         GenomeIndex::generate_streaming(&orig_params)?;
     }
 
+    // STAR writes `Log.out` to `<outFileNamePrefix>` during genomeGenerate
+    // and copies it into the genome directory at the end, so a STAR-built
+    // index directory always contains one; mirror that. The genomeDir copy
+    // is a second independent write, not `fs::copy` from the prefix file:
+    // concurrent genomeGenerate processes sharing a working directory (the
+    // integration-test harness does this) race on `<prefix>Log.out`, and on
+    // Windows `CopyFileEx` opens its source without write sharing, turning
+    // that race into a sharing-violation error (os error 32). Two plain
+    // creates use share-all flags and cannot collide.
+    let time_finish = chrono::Local::now();
+    crate::io::log::write_genome_generate_log(
+        &params.output_path("Log.out"),
+        params,
+        time_start,
+        time_finish,
+    )?;
+    crate::io::log::write_genome_generate_log(
+        &params.genome_dir.join("Log.out"),
+        params,
+        time_start,
+        time_finish,
+    )?;
+
     info!("Genome generation complete!");
     Ok(())
 }
@@ -154,15 +179,18 @@ trait AlignmentWriter: Send {
     fn finish(&mut self) -> Result<(), error::Error> {
         Ok(())
     }
-    /// Records still held in memory before `finish` sorts and writes them.
+    /// [`finish`](Self::finish), passing each record through `finalize` as it
+    /// is written.
     ///
-    /// Only the coordinate-sorted writers have any: STARsolo's `CB`/`UB` tags
-    /// are filled here, after the counting pass, which is exactly why STAR
-    /// restricts them to sorted BAM output.
-    fn buffered_records_mut(
+    /// Only the coordinate-sorted writers hold records until `finish`:
+    /// STARsolo's `CB`/`UB` tags are filled this way, after the counting pass,
+    /// which is exactly why STAR restricts them to sorted BAM output. The
+    /// streaming writers have already written everything and ignore it.
+    fn finish_with(
         &mut self,
-    ) -> Option<&mut Vec<noodles::sam::alignment::record_buf::RecordBuf>> {
-        None
+        _finalize: &mut dyn FnMut(&mut noodles::sam::alignment::record_buf::RecordBuf),
+    ) -> Result<(), error::Error> {
+        self.finish()
     }
 }
 
@@ -190,10 +218,11 @@ impl AlignmentWriter for NoQsWriter {
         self.0.finish()
     }
 
-    fn buffered_records_mut(
+    fn finish_with(
         &mut self,
-    ) -> Option<&mut Vec<noodles::sam::alignment::record_buf::RecordBuf>> {
-        self.0.buffered_records_mut()
+        finalize: &mut dyn FnMut(&mut noodles::sam::alignment::record_buf::RecordBuf),
+    ) -> Result<(), error::Error> {
+        self.0.finish_with(finalize)
     }
 }
 
@@ -240,10 +269,11 @@ impl AlignmentWriter for crate::io::bam::SortedBamWriter {
     fn finish(&mut self) -> Result<(), error::Error> {
         self.finish()
     }
-    fn buffered_records_mut(
+    fn finish_with(
         &mut self,
-    ) -> Option<&mut Vec<noodles::sam::alignment::record_buf::RecordBuf>> {
-        Some(self.records_mut())
+        finalize: &mut dyn FnMut(&mut noodles::sam::alignment::record_buf::RecordBuf),
+    ) -> Result<(), error::Error> {
+        self.finish_with(finalize)
     }
 }
 
@@ -278,10 +308,11 @@ impl AlignmentWriter for crate::io::bam::SortedBamStdoutWriter {
     fn finish(&mut self) -> Result<(), error::Error> {
         self.finish()
     }
-    fn buffered_records_mut(
+    fn finish_with(
         &mut self,
-    ) -> Option<&mut Vec<noodles::sam::alignment::record_buf::RecordBuf>> {
-        Some(self.records_mut())
+        finalize: &mut dyn FnMut(&mut noodles::sam::alignment::record_buf::RecordBuf),
+    ) -> Result<(), error::Error> {
+        self.finish_with(finalize)
     }
 }
 
@@ -833,23 +864,20 @@ fn run_single_pass(
         if params.solo_type != params::SoloType::CbSamTagOut {
             write_solo_output(sctx, params, &stats, &sj_stats, index)?;
         }
-        if sctx.read_info_enabled()
-            && let Some(records) = writer.buffered_records_mut()
-        {
+        if sctx.read_info_enabled() {
             let info = sctx
                 .read_info
                 .as_ref()
                 .expect("readInfo enabled")
                 .lock()
                 .unwrap();
-            crate::io::sam::apply_solo_read_info(
-                records,
-                &info,
-                &sctx.whitelist,
-                params.solo_umi_len as usize,
-            );
+            let umi_len = params.solo_umi_len as usize;
+            writer.finish_with(&mut |record| {
+                crate::io::sam::apply_solo_read_info(record, &info, &sctx.whitelist, umi_len);
+            })?;
+        } else {
+            writer.finish()?;
         }
-        writer.finish()?;
         stats.print_summary();
         return Ok(stats);
     }
@@ -1081,6 +1109,35 @@ struct AlignmentBatchResults {
     /// (transcripts.len() for SE, both_mapped.len() for PE).
     signal_contrib: Vec<(crate::align::transcript::Transcript, bool)>,
     signal_n_tr: usize,
+}
+
+/// Reads per alignment batch, chosen so a batch's result vector stays an
+/// ordinary-sized allocation.
+///
+/// [`run_batch_pipeline`] allocates a fresh `Vec<Result<T, Error>>` for every
+/// batch and drops it once consumed. mimalloc serves anything past its
+/// large-object threshold from the arena path rather than a thread-local page,
+/// so once that vector crosses roughly 512 KB each batch pays a fresh mapping
+/// and — with `arena_eager_commit` off, which `main` sets deliberately to keep
+/// RSS down — faults every page back in. At the previous fixed 10,000 reads the
+/// vector was 1.7 MB and that path accounted for ~38% of the samples in a solo
+/// run.
+///
+/// The ceiling is the measured one. Sweeping batch size on a 2M-read solo run
+/// (8 threads) put the optimum on a plateau from roughly 1000 to 2000 reads:
+/// 10,000 took 3.46s, 3000 2.29s, 2000 2.15s, 1500 2.13s, 1000 2.17s, 250 2.58s.
+/// Below the plateau per-batch dispatch starts to dominate, which is what the
+/// floor guards. Some of the per-batch cost tracks the read count rather than
+/// the result vector — sizing purely by bytes picked 4096 for the solo product
+/// and left time on the table — so the count is capped as well.
+///
+/// The byte rule still earns its place as the other half: it keeps the
+/// allocation under the threshold if the result struct grows later, rather than
+/// leaving a tuned constant to rot.
+fn batch_size_for<T>() -> usize {
+    const TARGET_BYTES: usize = 384 * 1024;
+    const MAX_READS: usize = 2048;
+    (TARGET_BYTES / std::mem::size_of::<Result<T, error::Error>>().max(1)).clamp(512, MAX_READS)
 }
 
 /// One `Result` per read/pair in an aligned batch.
@@ -1475,7 +1532,10 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
             "Chimeric detection enabled (chimSegmentMin={})",
             params.chim_segment_min
         );
-        Some(ChimericJunctionWriter::new(&params.out_file_name_prefix)?)
+        Some(ChimericJunctionWriter::new_with_multimap(
+            &params.out_file_name_prefix,
+            params.chim_multimap_nmax > 0,
+        )?)
     } else {
         None
     };
@@ -1488,7 +1548,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
         params.read_map_number as u64
     };
 
-    let batch_size = 10000;
+    let batch_size = batch_size_for::<AlignmentBatchResults>();
     let max_multimaps = params.out_filter_multimap_nmax as usize;
     // `--outSAMtype None` (e.g. quant-only) skips building SAM records.
     let emit_sam = params.emits_alignments();
@@ -1658,6 +1718,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                                 chim_writer.write_alignment(
                                     chim_aln,
                                     &index.genome.chr_name,
+                                    &index.genome.chr_start,
                                     &chim_aln.read_name,
                                 )?;
                             }
@@ -1724,6 +1785,7 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                                     chim_writer.write_alignment(
                                         chim_aln,
                                         &index.genome.chr_name,
+                                        &index.genome.chr_start,
                                         &chim_aln.read_name,
                                     )?;
                                 }
@@ -2120,7 +2182,7 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
     } else {
         params.read_map_number as u64
     };
-    let batch_size = 10000;
+    let batch_size = batch_size_for::<SoloReadProduct>();
     let clip5p = params.clip5p(0);
     let clip3p = params.clip3p(0);
     let cr4_clip = params.clip_adapter_type == "CellRanger4";
@@ -2503,7 +2565,7 @@ fn align_reads_solo_pe<W: AlignmentWriter + ?Sized>(
     } else {
         params.read_map_number as u64
     };
-    let batch_size = 10000;
+    let batch_size = batch_size_for::<SoloReadProduct>();
     // Per-mate clip: mate 1 (--clip5pNbases[0], e.g. 39 to strip the 5' barcode
     // region) and mate 2 ([1], e.g. 0). CellRanger4 adapter clipping is not used
     // by the cellgeni 5' path (it uses clip5pNbases instead), so it is not applied.
@@ -2971,7 +3033,10 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
             "Chimeric detection enabled (chimSegmentMin={})",
             params.chim_segment_min
         );
-        Some(ChimericJunctionWriter::new(&params.out_file_name_prefix)?)
+        Some(ChimericJunctionWriter::new_with_multimap(
+            &params.out_file_name_prefix,
+            params.chim_multimap_nmax > 0,
+        )?)
     } else {
         None
     };
@@ -2984,7 +3049,7 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
         params.read_map_number as u64
     };
 
-    let batch_size = 10000;
+    let batch_size = batch_size_for::<AlignmentBatchResults>();
     let max_multimaps = params.out_filter_multimap_nmax as usize;
     // `--outSAMtype None` (e.g. quant-only) skips building SAM records.
     let emit_sam = params.emits_alignments();
@@ -3141,6 +3206,20 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                         if let Some(ref mut tw) = tr_writer {
                             tw.write_batch(&batch.transcriptome_records)?;
                         }
+                        // Chimeric.out.junction. The writer was created and
+                        // flushed here but never written to, so a PE run reported
+                        // chimeric reads in Log.final.out and left the junction
+                        // file empty.
+                        if let Some(ref mut chim_writer) = chimeric_writer {
+                            for chim_aln in &batch.chimeric_alns {
+                                chim_writer.write_alignment(
+                                    chim_aln,
+                                    &index.genome.chr_name,
+                                    &index.genome.chr_start,
+                                    &chim_aln.read_name,
+                                )?;
+                            }
+                        }
                         if params.chim_out_within_bam() {
                             use crate::chimeric::build_within_bam_records;
                             for chim_aln in &batch.chimeric_alns {
@@ -3200,6 +3279,16 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                             writer.write_batch(&records)?;
                             if let Some(ref mut tw) = tr_writer {
                                 tw.write_batch(&meta.transcriptome_records)?;
+                            }
+                            if let Some(ref mut chim_writer) = chimeric_writer {
+                                for chim_aln in &meta.chimeric_alns {
+                                    chim_writer.write_alignment(
+                                        chim_aln,
+                                        &index.genome.chr_name,
+                                        &index.genome.chr_start,
+                                        &chim_aln.read_name,
+                                    )?;
+                                }
                             }
                             if params.chim_out_within_bam() {
                                 use crate::chimeric::build_within_bam_records;
