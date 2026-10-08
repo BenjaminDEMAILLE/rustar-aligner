@@ -1808,6 +1808,37 @@ impl Parameters {
             .rg_ids()
             .map_err(|e| command.error(ErrorKind::InvalidValue, e))?;
 
+        // STARsolo tags exist only in BAM records: STAR refuses them without BAM
+        // output (`samAttrRequiresBAM`, Parameters_samAttributes.cpp:226-241)
+        // rather than dropping them. STAR tests `sF` through the `sS` flag, and
+        // does not test `gx`/`gn` at all, so neither is listed on its own here.
+        if !params.bam_output() {
+            for (attr, tag) in [
+                (SamAttributes::CR, "CR"),
+                (SamAttributes::CY, "CY"),
+                (SamAttributes::UR, "UR"),
+                (SamAttributes::UY, "UY"),
+                (SamAttributes::CB, "CB"),
+                (SamAttributes::UB, "UB"),
+                (SamAttributes::SM, "sM"),
+                (SamAttributes::SS, "sS"),
+                (SamAttributes::SQ, "sQ"),
+                (SamAttributes::GX, "GX"),
+                (SamAttributes::GN, "GN"),
+            ] {
+                if params.out_sam_attributes.contains(attr) {
+                    return Err(command.error(
+                        ErrorKind::InvalidValue,
+                        format!(
+                            "--outSAMattributes contains {tag} tag, which requires BAM output; \
+                             re-run with --outSAMtype BAM Unsorted (and/or) SortedByCoordinate, \
+                             or without {tag} in --outSAMattributes"
+                        ),
+                    ));
+                }
+            }
+        }
+
         // Fold runtime-derived bits into out_sam_attributes so writers can read
         // it directly without re-computing. Mirrors STAR Parameters_samAttributes.cpp.
         if params.rg_line_set() {
@@ -3250,6 +3281,9 @@ mod tests {
         let p = try_parse(&[
             "--readFilesIn",
             "r.fq",
+            "--outSAMtype",
+            "BAM",
+            "Unsorted",
             "--outSAMattributes",
             "NH",
             "HI",
@@ -3286,6 +3320,21 @@ mod tests {
     /// `CB`/`UB` are filled when the sorted BAM is written, so STAR refuses them
     /// with any other output type, and refuses `UB` outright for `CB_samTagOut`
     /// (no UMI collapsing there). `ParametersSolo.cpp:403-435`.
+    #[test]
+    fn solo_attributes_require_bam_output() {
+        for tag in ["CR", "UR", "CB", "sM", "sS", "GX", "GN"] {
+            let err = try_parse(&["--readFilesIn", "r.fq", "--outSAMattributes", "NH", tag])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("requires BAM output"), "{tag}: {err}");
+        }
+        // gx/gn are not in STAR's samAttrRequiresBAM list.
+        let unsorted = ["--outSAMtype", "BAM", "Unsorted"];
+        let mut args = vec!["--readFilesIn", "r.fq", "--outSAMattributes", "NH", "GX"];
+        args.extend_from_slice(&unsorted);
+        assert!(try_parse(&args).is_ok());
+    }
+
     #[test]
     fn cb_ub_attributes_require_a_sorted_bam_and_a_gene_feature() {
         let solo = [
@@ -3358,6 +3407,9 @@ mod tests {
             "wl.txt",
             "--soloCBmatchWLtype",
             "1MM",
+            "--outSAMtype",
+            "BAM",
+            "Unsorted",
         ];
         let mut cb_only = tag_out.to_vec();
         cb_only.extend_from_slice(&["--outSAMattributes", "NH", "CB"]);
