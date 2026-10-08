@@ -65,6 +65,45 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ### Bug fixes
 
+- **`--quantMode TranscriptomeSAM` no longer aborts on reads soft-clipped at
+  both ends of a single match block** (e.g. `1S97M2S`). With the default
+  `--quantTranscriptomeSAMoutput BanSingleEnd_BanIndels_ExtendSoftclip`, the
+  right clip was dropped when folding clips into the CIGAR, the record came out
+  shorter than its sequence, and BAM encoding failed with "read
+  length-sequence length mismatch", ending the run. Seen on human chr21
+  paired-end data. From #283.
+
+- **Unknown `--quantMode` values are rejected**, as STAR does
+  (`Parameters.cpp:898-936`): only `TranscriptomeSAM`, `GeneCounts` or `-`. A
+  typo such as `Genecounts` used to be ignored silently, producing no counts
+  and no error. From #283.
+
+- **`mappedFilter` ported as STAR has it** (`ReadAlign_mappedFilter.cpp`).
+  The read is judged on its best alignment alone, in STAR's order: too short
+  (score or matched bases), then too many mismatches, then too many loci; the
+  whole set is kept or dropped together. Single-end filtered each alignment
+  separately, so a secondary could be dropped on its own numbers.
+  - Matched bases are STAR's `nMatch` (read equals genome), not the aligned
+    length, which counted mismatches and `N` as matches and made
+    `--outFilterMatchNminOverLread` looser than STAR's.
+  - `--outFilterMismatchNoverLmax` divides by the mapped length (`rLength`),
+    not the read length, in single-end and paired-end.
+  - `--outFilterIntronMotifs` / `--outFilterIntronStrands` apply when a
+    transcript is finalized and before the window's dedup, as in
+    `stitchWindowAligns`, so a rejected transcript cannot evict one it covers,
+    set the score range or become a chimeric segment. Paired-end did not apply
+    them at all. `--outSAMstrandField intronMotif` also drops a spliced
+    transcript whose strand is undefined, as STAR does.
+  - Paired-end reads with more than `--outFilterMultimapNmax` loci are reported
+    as "too many loci"; they were cleared inside the filter and fell through to
+    "too short". A failing best pair now reports its own reason, and a pair
+    with no transcript in any window is "other", as in single-end.
+
+  Yeast 10k: alignments unchanged; PE unmapped types now match STAR read for
+  read (`too many loci` 0 → 21, STAR 21). Human chr21 SE: multi / too many
+  loci / too short 6051 / 221 / 2008 → 6114 / 234 / 1956 (STAR 6116 / 232 /
+  1955). Supersedes #169 and #252.
+
 - **Multi-member gzip input is no longer truncated.** Compressed input was
   decoded with `flate2::read::GzDecoder`, which stops at the end of the first
   gzip member; a `.gz` made of several concatenated members (bcl2fastq output,
