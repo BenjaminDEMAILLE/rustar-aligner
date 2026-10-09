@@ -479,7 +479,7 @@ mod tests {
             ],
         );
         let out = transform_transcript(&orig, &jdb, &blocks, &tr, 21, 1_000_000).unwrap();
-        assert!(out.junction_motifs.is_empty());
+        assert_eq!(out.junction_motifs, Vec::new());
         assert_eq!(out.n_junction, 0);
         assert_eq!(out.cigar_string(), "20M5D20M");
     }
