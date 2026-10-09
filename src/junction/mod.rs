@@ -560,6 +560,7 @@ mod tests {
             shift_left: 0,
             shift_right: 0,
             strand,
+            src_strand: strand,
         }
     }
 
@@ -637,6 +638,7 @@ mod tests {
             shift_left: 3,
             shift_right: 0,
             strand: 0,
+            src_strand: 0,
         };
         assert_eq!(noncan.stored_start(), 100);
         assert_eq!(noncan.original_start(), 103);
