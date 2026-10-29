@@ -493,16 +493,26 @@ fn align_read_inner(
     // to the earliest-discovered alignment, so we must not reorder here (the
     // old code sorted by coordinate, destroying that order).
     {
-        let mut seen = std::collections::HashSet::new();
-        transcripts.retain(|t| {
-            seen.insert((
-                t.chr_idx,
-                t.genome_start,
-                t.genome_end,
-                t.is_reverse,
-                t.cigar_string(),
-            ))
-        });
+        // Keyed on the position, with the CIGARs of one position compared
+        // directly: no CIGAR string is built per transcript.
+        let mut firsts: rustc_hash::FxHashMap<(usize, u64, u64, bool), Vec<usize>> =
+            rustc_hash::FxHashMap::default();
+        let keep: Vec<bool> = transcripts
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let same = firsts
+                    .entry((t.chr_idx, t.genome_start, t.genome_end, t.is_reverse))
+                    .or_default();
+                let dup = same.iter().any(|&j| transcripts[j].cigar == t.cigar);
+                if !dup {
+                    same.push(i);
+                }
+                !dup
+            })
+            .collect();
+        let mut keep = keep.into_iter();
+        transcripts.retain(|_| keep.next().unwrap_or(true));
     }
 
     // STAR's `trBest` (ReadAlign_stitchPieces.cpp), over the transcripts in window
@@ -1137,18 +1147,36 @@ pub fn align_paired_read(
     // earliest-discovered pair, so discovery order has to survive to the
     // primary-selection sort below.
     {
-        let mut seen = std::collections::HashSet::new();
-        joint_pairs.retain(|p| {
-            seen.insert((
-                p.mate1_transcript.chr_idx,
-                p.mate1_transcript.genome_start,
-                p.mate1_transcript.is_reverse,
-                p.mate1_transcript.cigar_string(),
-                p.mate2_transcript.genome_start,
-                p.mate2_transcript.is_reverse,
-                p.mate2_transcript.cigar_string(),
-            ))
-        });
+        // Keyed on the mate positions, with the CIGARs of one key compared
+        // directly: no CIGAR string is built per pair.
+        let mut firsts: rustc_hash::FxHashMap<(usize, u64, bool, u64, bool), Vec<usize>> =
+            rustc_hash::FxHashMap::default();
+        let keep: Vec<bool> = joint_pairs
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let (m1, m2) = (&p.mate1_transcript, &p.mate2_transcript);
+                let same = firsts
+                    .entry((
+                        m1.chr_idx,
+                        m1.genome_start,
+                        m1.is_reverse,
+                        m2.genome_start,
+                        m2.is_reverse,
+                    ))
+                    .or_default();
+                let dup = same.iter().any(|&j| {
+                    let q = &joint_pairs[j];
+                    q.mate1_transcript.cigar == m1.cigar && q.mate2_transcript.cigar == m2.cigar
+                });
+                if !dup {
+                    same.push(i);
+                }
+                !dup
+            })
+            .collect();
+        let mut keep = keep.into_iter();
+        joint_pairs.retain(|_| keep.next().unwrap_or(true));
     }
 
     // Step 2: score-range filter (STAR's multMapSelect).
