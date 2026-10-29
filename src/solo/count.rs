@@ -590,28 +590,7 @@ fn build_matrix_body(
                 // `MultiGeneUMI_CR` decides gene ownership on *corrected*
                 // UMIs, so it needs the correction to have happened first and
                 // cannot go through the shared filter-then-dedup path below.
-                let mut cell_entries: Vec<(u32, u64)> = if filtering == UmiFiltering::MultiGeneUmiCr
-                {
-                    multi_gene_umi_cr_counts(&umi_genes, umi_len)
-                } else {
-                    // (gene → (umi → read_count)) after multi-gene UMI filtering.
-                    let mut gene_umis: HashMap<u32, HashMap<u64, u32>> = HashMap::default();
-                    for (&umi, genes) in &umi_genes {
-                        for (&gene, &rc) in filter_multi_gene_umi(genes, filtering) {
-                            *gene_umis.entry(gene).or_default().entry(umi).or_insert(0) += rc;
-                        }
-                    }
-
-                    // Collapse UMIs per gene, then emit gene-ascending.
-                    let mut entries: Vec<(u32, u64)> = Vec::with_capacity(gene_umis.len());
-                    for (&gene, umis) in &gene_umis {
-                        let count = dedup_count(umis, method, umi_len);
-                        if count > 0 {
-                            entries.push((gene, count));
-                        }
-                    }
-                    entries
-                };
+                let mut cell_entries = cell_feature_counts(&umi_genes, filtering, method, umi_len);
                 cell_entries.sort_unstable_by_key(|&(g, _)| g);
 
                 // STAR's readInfo: every read counted for this cell records the
@@ -1944,6 +1923,7 @@ pub fn write_gene_matrix(
         let sj_counts = build_sj_matrix(
             &sj_records,
             &row,
+            filtering,
             method,
             umi_len,
             &sj_dir.join(&matrix_name),
@@ -2080,6 +2060,41 @@ pub fn write_gene_matrix(
     Ok(())
 }
 
+/// One cell's `(feature, UMI count)` entries from its `umi → feature → reads`
+/// map: STAR's multi-gene UMI filtering (`--soloUMIfiltering`), then UMI
+/// collapsing per feature. STAR runs this on every feature, SJ included, where a
+/// read crossing two junctions is one UMI on two features
+/// (`SoloFeature_collapseUMIall.cpp`).
+fn cell_feature_counts(
+    umi_genes: &HashMap<u64, HashMap<u32, u32>>,
+    filtering: UmiFiltering,
+    method: UmiDedup,
+    umi_len: usize,
+) -> Vec<(u32, u64)> {
+    // `MultiGeneUMI_CR` decides gene ownership on *corrected* UMIs, so it
+    // needs the correction to have happened first and cannot go through the
+    // shared filter-then-dedup path below.
+    if filtering == UmiFiltering::MultiGeneUmiCr {
+        return multi_gene_umi_cr_counts(umi_genes, umi_len);
+    }
+    // (gene → (umi → read_count)) after multi-gene UMI filtering.
+    let mut gene_umis: HashMap<u32, HashMap<u64, u32>> = HashMap::default();
+    for (&umi, genes) in umi_genes {
+        for (&gene, &rc) in filter_multi_gene_umi(genes, filtering) {
+            *gene_umis.entry(gene).or_default().entry(umi).or_insert(0) += rc;
+        }
+    }
+    // Collapse UMIs per gene.
+    let mut entries: Vec<(u32, u64)> = Vec::with_capacity(gene_umis.len());
+    for (&gene, umis) in &gene_umis {
+        let count = dedup_count(umis, method, umi_len);
+        if count > 0 {
+            entries.push((gene, count));
+        }
+    }
+    entries
+}
+
 /// Build the SJ feature matrix from (cell, UMI, junction) records, mapping each
 /// junction's absolute intron coords to its `SJ.out.tab` row and UMI-collapsing
 /// per (cell, junction). Junctions not in `row` (filtered out of SJ.out.tab) are
@@ -2088,6 +2103,7 @@ pub fn write_gene_matrix(
 fn build_sj_matrix(
     records: &[crate::solo::SjCountRecord],
     row: &HashMap<(u64, u64), u32>,
+    filtering: UmiFiltering,
     method: UmiDedup,
     umi_len: usize,
     matrix_path: &Path,
@@ -2112,22 +2128,18 @@ fn build_sj_matrix(
         let mut i = 0;
         while i < recs.len() {
             let cb = recs[i].cb;
-            // junction row → (umi → read count) for this cell.
-            let mut sj_umis: HashMap<u32, HashMap<u64, u32>> = HashMap::default();
+            // umi → (junction row → read count) for this cell.
+            let mut umi_rows: HashMap<u64, HashMap<u32, u32>> = HashMap::default();
             while i < recs.len() && recs[i].cb == cb {
                 let r = recs[i];
                 if let Some(&rw) = row.get(&(r.intron_start, r.intron_end)) {
-                    *sj_umis.entry(rw).or_default().entry(r.umi).or_insert(0) += 1;
+                    *umi_rows.entry(r.umi).or_default().entry(rw).or_insert(0) += 1;
                     counts.reads += 1;
                     counts.exact += u64::from(r.exact);
                 }
                 i += 1;
             }
-            let mut entries: Vec<(u32, u64)> = sj_umis
-                .into_iter()
-                .map(|(rw, umis)| (rw, dedup_count(&umis, method, umi_len)))
-                .filter(|&(_, c)| c > 0)
-                .collect();
+            let mut entries = cell_feature_counts(&umi_rows, filtering, method, umi_len);
             entries.sort_unstable_by_key(|&(rw, _)| rw);
             if !entries.is_empty() {
                 counts.cells += 1;
@@ -3050,6 +3062,43 @@ mod tests {
         let em = distribute_multi(MultiMethod::Em, &u, &[vec![0u32, 1u32]]);
         assert_eq!(em[&0], 0.007_812_5);
         assert_eq!(em[&1], 1.992_187_5);
+    }
+
+    /// STAR filters multi-gene UMIs on every feature, SJ included: a read that
+    /// crosses two junctions is one UMI on two features, a tie that
+    /// `MultiGeneUMI_CR` drops.
+    #[test]
+    fn sj_matrix_applies_multi_gene_umi_filtering() {
+        let rec = |intron_start| crate::solo::SjCountRecord {
+            cb: 3,
+            umi: 42,
+            intron_start,
+            intron_end: intron_start + 100,
+            exact: true,
+        };
+        let records = vec![rec(1000), rec(2000)];
+        let row: HashMap<(u64, u64), u32> =
+            [((1000, 1100), 0), ((2000, 2100), 1)].into_iter().collect();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("matrix.mtx");
+        let run = |filtering| {
+            build_sj_matrix(
+                &records,
+                &row,
+                filtering,
+                UmiDedup::OneMmCr,
+                10,
+                &path,
+                2,
+                8,
+                false,
+            )
+            .unwrap()
+        };
+        let plain = run(UmiFiltering::None);
+        assert_eq!((plain.umis, plain.cells, plain.reads), (2, 1, 2));
+        let cr = run(UmiFiltering::MultiGeneUmiCr);
+        assert_eq!((cr.umis, cr.cells, cr.reads), (0, 0, 2));
     }
 
     #[test]
