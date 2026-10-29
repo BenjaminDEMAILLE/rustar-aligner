@@ -137,6 +137,81 @@ fn score_region(
 /// staging copy is amortized, small enough to sit on the stack.
 const SCORE_REGION_CHUNK: usize = 256;
 
+/// Windows with fewer seeds than this have few recursion leaves, and hashing
+/// the extension costs more there than it saves.
+const MEMO_EXTENSIONS_MIN_SEEDS: usize = 25;
+
+/// [`extend_alignment`] memoized in the window's cache. Within one window the
+/// read, genome strand and mismatch limits are fixed, so the [`ExtendKey`]
+/// fields decide the result; the recursion's leaves repeat many of them.
+#[allow(clippy::too_many_arguments)]
+fn extend_alignment_cached(
+    jcache: &mut crate::align::score::JunctionScanCache,
+    read_seq: &[u8],
+    read_start: usize,
+    genome_start: u64,
+    direction: i32,
+    max_extend: usize,
+    n_mm_prev: u32,
+    len_prev: usize,
+    n_mm_max: u32,
+    p_mm_max: f64,
+    index: &GenomeIndex,
+    is_reverse: bool,
+    extend_to_end: bool,
+) -> ExtendResult {
+    let key = (
+        read_start,
+        genome_start,
+        direction,
+        max_extend,
+        n_mm_prev,
+        len_prev,
+        extend_to_end,
+    );
+    if !jcache.memo_extensions {
+        return extend_alignment(
+            read_seq,
+            read_start,
+            genome_start,
+            direction,
+            max_extend,
+            n_mm_prev,
+            len_prev,
+            n_mm_max,
+            p_mm_max,
+            index,
+            is_reverse,
+            extend_to_end,
+        );
+    }
+    if let Some(&(extend_len, max_score, n_mismatch)) = jcache.ext.get(&key) {
+        return ExtendResult {
+            extend_len,
+            max_score,
+            n_mismatch,
+        };
+    }
+    let r = extend_alignment(
+        read_seq,
+        read_start,
+        genome_start,
+        direction,
+        max_extend,
+        n_mm_prev,
+        len_prev,
+        n_mm_max,
+        p_mm_max,
+        index,
+        is_reverse,
+        extend_to_end,
+    );
+    jcache
+        .ext
+        .insert(key, (r.extend_len, r.max_score, r.n_mismatch));
+    r
+}
+
 /// Result of extending an alignment into flanking regions
 #[derive(Debug, Clone)]
 struct ExtendResult {
@@ -1188,7 +1263,8 @@ fn stitch_align_to_transcript(
         // extendToEnd=false (local mode); spacer at position 150 naturally stops the extension.
         // nMatch approximated as score + n_mismatch (exact for seeds-only paths, approx otherwise).
         let n_match_m1 = (wt.score + wt.n_mismatch as i32).max(0) as usize;
-        let right_ext = extend_alignment(
+        let right_ext = extend_alignment_cached(
+            jcache,
             read_seq,
             last_exon.read_end,
             last_exon.genome_end,
@@ -1248,7 +1324,8 @@ fn stitch_align_to_transcript(
             }
         };
         let n_match_for_left = n_match_m1 + right_ext.extend_len + wa.length;
-        let left_ext = extend_alignment(
+        let left_ext = extend_alignment_cached(
+            jcache,
             read_seq,
             wa.read_pos,
             wa.sa_pos,
@@ -2566,7 +2643,8 @@ fn stitch_recurse(
             let first_ext = if do_left_first {
                 // Left extension (5' of forward read)
                 if wt.read_start > 0 {
-                    extend_alignment(
+                    extend_alignment_cached(
+                        jcache,
                         read_seq,
                         wt.read_start,
                         wt.genome_start,
@@ -2586,7 +2664,8 @@ fn stitch_recurse(
             } else {
                 // Right extension (5' of reverse read)
                 if wt.read_end < read_seq.len() {
-                    extend_alignment(
+                    extend_alignment_cached(
+                        jcache,
                         read_seq,
                         wt.read_end,
                         wt.genome_end,
@@ -2612,7 +2691,8 @@ fn stitch_recurse(
                 // Right extension (3' of forward read)
                 let read_end_after = wt.read_end; // right boundary unchanged by left ext
                 if read_end_after < read_seq.len() {
-                    extend_alignment(
+                    extend_alignment_cached(
+                        jcache,
                         read_seq,
                         read_end_after,
                         wt.genome_end,
@@ -2633,7 +2713,8 @@ fn stitch_recurse(
                 // Left extension (3' of reverse read)
                 let read_start_after = wt.read_start; // left boundary unchanged by right ext
                 if read_start_after > 0 {
-                    extend_alignment(
+                    extend_alignment_cached(
+                        jcache,
                         read_seq,
                         read_start_after,
                         wt.genome_start,
@@ -3427,6 +3508,8 @@ pub(crate) fn stitch_seeds_core(
     // fixed for the whole recursion below, which is what makes the six-field
     // key in `JunctionScanCache` a complete identifier for a scan.
     let mut jcache = crate::align::score::JunctionScanCache::new();
+    // Memoizing extensions pays only where the recursion has many leaves.
+    jcache.memo_extensions = wa_entries.len() >= MEMO_EXTENSIONS_MIN_SEEDS;
 
     stitch_recurse(
         0,
