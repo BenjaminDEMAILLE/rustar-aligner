@@ -1077,6 +1077,11 @@ pub(crate) struct WorkingTranscript {
     pub(crate) read_end: usize,
     pub(crate) genome_start: u64,
     pub(crate) genome_end: u64,
+    /// Final score ([`wt_final_score`]) and mapped length ([`wt_mapped_length`]),
+    /// stored when the transcript is recorded in its window: every later
+    /// transcript of the window is compared against them.
+    pub(crate) window_score: i32,
+    pub(crate) mapped_len: u32,
 }
 
 impl WorkingTranscript {
@@ -1096,6 +1101,8 @@ impl WorkingTranscript {
             read_end: 0,
             genome_start: 0,
             genome_end: 0,
+            window_score: 0,
+            mapped_len: 0,
         }
     }
 }
@@ -2721,7 +2728,7 @@ fn stitch_recurse(
                     _ => None,
                 };
                 // An empty window compares against STAR's `trInit`, score 0.
-                let window_best = transcripts.first().map_or(0, |t| wt_final_score(t, scorer));
+                let window_best = transcripts.first().map_or(0, |t| t.window_score);
                 if !window_score_gate(score, frag, window_best, max_score_mate, scorer) {
                     return;
                 }
@@ -2739,8 +2746,8 @@ fn stitch_recurse(
                 let existing = &transcripts[idx];
                 let overlap = blocks_overlap(&wt.exons, &existing.exons);
                 let u_new = wt_len - overlap;
-                let u_old = wt_mapped_length(existing) - overlap;
-                if u_new == 0 && wt_score < wt_final_score(existing, scorer) {
+                let u_old = existing.mapped_len - overlap;
+                if u_new == 0 && wt_score < existing.window_score {
                     dominated = true;
                     break;
                 } else if u_old == 0 {
@@ -2764,10 +2771,13 @@ fn stitch_recurse(
                 let pos = transcripts
                     .iter()
                     .position(|t| {
-                        let score = wt_final_score(t, scorer);
+                        let score = t.window_score;
                         wt_score > score || (wt_score == score && wt_span < span(t))
                     })
                     .unwrap_or(transcripts.len());
+                let mut wt = wt;
+                wt.window_score = wt_score;
+                wt.mapped_len = wt_len;
                 transcripts.insert(pos, wt);
                 transcripts.truncate(max_transcripts);
             }
@@ -3077,6 +3087,8 @@ pub(crate) fn split_combined_wt(
             read_end: m1_read_end,
             genome_start: m1_genome_start,
             genome_end: m1_genome_end,
+            window_score: 0,
+            mapped_len: 0,
         },
         WorkingTranscript {
             exons: m2_exons,
@@ -3093,6 +3105,8 @@ pub(crate) fn split_combined_wt(
             read_end: m2_read_end,
             genome_start: m2_genome_start,
             genome_end: m2_genome_end,
+            window_score: 0,
+            mapped_len: 0,
         },
     ))
 }
