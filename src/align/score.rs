@@ -488,6 +488,11 @@ impl AlignmentScorer {
         // runs is decided once rather than per iteration.
         let motif_in_range =
             del >= self.align_intron_min as i64 && del <= self.align_intron_max as i64;
+        let max_motif = self
+            .score_gap
+            .max(self.score_gap_gcag)
+            .max(self.score_gap_atac)
+            .max(self.score_gap_noncan);
 
         // The four motif bases sit at `donor`, `donor+1`, `donor+del-2` and
         // `donor+del-1`, and `donor` moves exactly one base per iteration, so
@@ -554,6 +559,16 @@ impl AlignmentScorer {
                     best_motif = SpliceMotif::NonCanonical;
                     best_motif_score = 0;
                 }
+            }
+
+            // `score1` rises by at most 1 a position, so once even that cannot
+            // lift a later position past the best one the rest of the scan is
+            // settled. Ties win only in the reverse-strand deletion case.
+            let scan_end = r_gap as i32 + next_seed_len as i32;
+            let bound = score1 + (scan_end - 1 - jr1) + if motif_in_range { max_motif } else { 0 };
+            let tie_wins = !motif_in_range && is_reverse;
+            if bound < max_score2 || (bound == max_score2 && !tie_wins) {
+                break;
             }
 
             jr1 += 1;
