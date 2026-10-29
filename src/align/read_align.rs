@@ -864,6 +864,10 @@ pub fn align_paired_read(
                 ) else {
                     continue;
                 };
+                // Both halves carry the pair's stitched mismatch count (STAR's trA.nMM,
+                // which also bounds each extension); keep it once, on mate1, so that
+                // the mates sum to STAR's nMM for the pair.
+                t2.n_mismatch -= m2_wt.n_mismatch;
 
                 any_transcript = true;
                 if stitch_is_reverse {
