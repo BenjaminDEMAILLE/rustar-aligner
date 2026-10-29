@@ -1747,13 +1747,30 @@ pub fn write_gene_matrix(
         }
 
         // --soloMultiMappers: UniqueAndMult-<method>.mtx alongside raw.
-        let (mut multi_counted, mut multi_dropped) = (0u64, 0u64);
+        let (mut multi_counted, mut multi_dropped, mut multi_posterior) = (0u64, 0u64, 0u64);
         if !multi_methods.is_empty() {
             let mut mg = recorder.multi_gene.lock().unwrap();
-            let before = mg.len();
-            mg.retain(|r| cb_passes_one_exact(one_exact, &exact_counts, r.cb));
+            // 1MM_multi barcodes: the same posterior as unique-gene reads; a
+            // barcode it cannot pick is `noTooManyWLmatches`. oneExact applies
+            // to single corrections only.
+            let (pending, mut resolved): (Vec<_>, Vec<_>) = std::mem::take(&mut *mg)
+                .into_iter()
+                .partition(|r| !r.candidates.is_empty());
+            let before = resolved.len();
+            resolved.retain(|r| cb_passes_one_exact(one_exact, &exact_counts, r.cb));
+            multi_dropped = (before - resolved.len()) as u64;
+            for mut r in pending {
+                match resolve_multi_cb(&r.candidates, &exact_counts, pseudocount) {
+                    Some(cb) => {
+                        r.cb = cb;
+                        r.candidates.clear();
+                        resolved.push(r);
+                    }
+                    None => multi_posterior += 1,
+                }
+            }
+            *mg = resolved;
             multi_counted = mg.len() as u64;
-            multi_dropped = (before - mg.len()) as u64;
             build_multi_matrices(
                 &body,
                 &mg,
@@ -1781,7 +1798,10 @@ pub fn write_gene_matrix(
                 F::NO_MM_TO_WL_WITHOUT_EXACT,
                 mstats.dropped_one_exact + multi_dropped,
             );
-            st.add(F::NO_TOO_MANY_WL_MATCHES, mstats.dropped_posterior);
+            st.add(
+                F::NO_TOO_MANY_WL_MATCHES,
+                mstats.dropped_posterior + multi_posterior,
+            );
             st.add(F::YES_WL_MATCH, mstats.unique_reads + multi_counted);
             st.add(F::YES_SUB_WL_MATCH_UNIQUE_FEATURE, mstats.unique_reads);
             st.add(F::YES_UMIS, mstats.cells.iter().map(|c| c.n_umis).sum());
