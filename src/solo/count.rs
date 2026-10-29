@@ -876,38 +876,54 @@ fn distribute_multi(
             }
         }
         MultiMethod::Em => {
-            // theta_g = u_g + (multi distributed proportional to theta), iterated.
-            let mut theta = u.clone();
+            // STAR's gEem (`SoloFeature_collapseUMIall.cpp`): start from the
+            // unique counts plus the uniform spread; each round zeroes the
+            // previous estimate's values below 0.01, then gives every molecule to
+            // its genes in proportion to that estimate. It stops once no gene
+            // moved by 0.01, or after 101 rounds, and keeps that round's estimate,
+            // which can still hold values below 0.01.
+            let genes: std::collections::BTreeSet<u32> =
+                molecules.iter().flatten().copied().collect();
+            let mut old: HashMap<u32, f64> = genes.iter().map(|&g| (g, 0.0)).collect();
             for s in molecules {
+                let w = unit(s);
                 for &g in s {
-                    theta.entry(g).or_insert(0.0);
+                    *old.get_mut(&g).unwrap() += w;
                 }
             }
-            for _ in 0..100 {
-                let mut next = u.clone();
-                for s in molecules {
-                    for &g in s {
-                        next.entry(g).or_insert(0.0);
+            for (&g, v) in &mut old {
+                *v += get(u, g);
+            }
+            let mut iter = 0u32;
+            let new = loop {
+                iter += 1;
+                let mut new: HashMap<u32, f64> = genes.iter().map(|&g| (g, get(u, g))).collect();
+                for v in old.values_mut() {
+                    if *v < 0.01 {
+                        *v = 0.0;
                     }
                 }
                 for s in molecules {
-                    let total: f64 = s.iter().map(|&g| get(&theta, g)).sum();
-                    for &g in s {
-                        let w = if total > 0.0 {
-                            get(&theta, g) / total
-                        } else {
-                            unit(s)
-                        };
-                        *next.get_mut(&g).unwrap() += w;
+                    let norm = 1.0 / s.iter().map(|g| old[g]).sum::<f64>();
+                    for g in s {
+                        *new.get_mut(g).unwrap() += old[g] * norm;
                     }
                 }
-                let delta: f64 = next.iter().map(|(g, v)| (v - get(&theta, *g)).abs()).sum();
-                theta = next;
-                if delta < 1e-6 {
-                    break;
+                let max_change = genes
+                    .iter()
+                    .map(|g| (new[g] - old[g]).abs())
+                    .fold(0.0, f64::max);
+                if max_change < 0.01 || iter > 100 {
+                    break new;
                 }
+                old = new;
+            };
+            // STAR keeps the multi part (gEem - gEu) and adds the unique count
+            // back when it writes the matrix.
+            for g in genes {
+                let ug = get(u, g);
+                out.insert(g, ug + (new[&g] - ug));
             }
-            out = theta;
         }
     }
     out
@@ -990,9 +1006,11 @@ fn build_multi_matrices(
          -> Result<(), Error> {
             let mols = cell_molecules(cb, mptr);
             for (k, &m) in methods.iter().enumerate() {
-                let counts = distribute_multi(m, u, &mols);
+                // Every gene of the cell's unique counts or of a multi-gene
+                // molecule is written, a zero included (STAR's outputResults
+                // walks both lists without testing the value).
                 let mut entries: Vec<(u32, f64)> =
-                    counts.into_iter().filter(|&(_, v)| v > 1e-9).collect();
+                    distribute_multi(m, u, &mols).into_iter().collect();
                 entries.sort_unstable_by_key(|&(g, _)| g);
                 for (g, v) in entries {
                     writeln!(writers[k], "{} {} {}", g + 1, cb + 1, fmt_real(v))
@@ -3001,6 +3019,17 @@ mod tests {
         let empty: HashMap<u32, f64> = HashMap::default();
         let pu0 = distribute_multi(MultiMethod::PropUnique, &empty, &mols);
         assert!((pu0[&0] - 0.5).abs() < 1e-9 && (pu0[&1] - 0.5).abs() < 1e-9);
+    }
+
+    /// STAR's EM zeroes values below 0.01 at the start of a round, not at the
+    /// end, and stops once nothing moved by 0.01: a gene with no unique count
+    /// halves each round from its uniform 0.5 and keeps 2^-7 when it stops.
+    #[test]
+    fn em_keeps_the_last_round_below_the_cutoff() {
+        let u: HashMap<u32, f64> = [(1u32, 1.0)].into_iter().collect();
+        let em = distribute_multi(MultiMethod::Em, &u, &[vec![0u32, 1u32]]);
+        assert_eq!(em[&0], 0.007_812_5);
+        assert_eq!(em[&1], 1.992_187_5);
     }
 
     #[test]
