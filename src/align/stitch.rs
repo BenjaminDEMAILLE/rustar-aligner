@@ -942,14 +942,20 @@ pub fn cluster_seeds(
 
             // Capacity check (seedPerWindowNmax) with anchor protection
             if window.alignments.len() >= seed_per_window_nmax {
-                // Find min length of non-anchor entries (STAR: recalculate WALrec)
-                let min_non_anchor_len = window
+                // Find min length of non-anchor entries (STAR: recalculate WALrec).
+                // With none, STAR drops the whole read before it looks at the new
+                // align, so a non-anchor arriving at a window full of anchors still
+                // triggers it: MARKER_TOO_MANY_ANCHORS_PER_WINDOW → nW=0.
+                let Some(min_non_anchor_len) = window
                     .alignments
                     .iter()
                     .filter(|wa| !wa.is_anchor)
                     .map(|wa| wa.length)
                     .min()
-                    .unwrap_or(usize::MAX);
+                else {
+                    too_many_anchors = true;
+                    break 'outer;
+                };
 
                 // Update persistent threshold
                 window.wa_lrec = min_non_anchor_len;
@@ -964,12 +970,6 @@ pub fn cluster_seeds(
                 window
                     .alignments
                     .retain(|wa| wa.is_anchor || wa.length > min_non_anchor_len);
-
-                if window.alignments.len() >= seed_per_window_nmax {
-                    // STAR: MARKER_TOO_MANY_ANCHORS_PER_WINDOW → nW=0, abort entire read
-                    too_many_anchors = true;
-                    break 'outer;
-                }
             }
 
             // STAR's addition condition: if (aAnchor || aLength > WALrec[iW])
