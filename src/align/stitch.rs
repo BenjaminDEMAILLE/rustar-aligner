@@ -141,6 +141,19 @@ const SCORE_REGION_CHUNK: usize = 256;
 /// the extension costs more there than it saves.
 const MEMO_EXTENSIONS_MIN_SEEDS: usize = 25;
 
+/// Most extensions memoized per window. The table is kept for the thread's
+/// lifetime, so this bounds what it holds. 7/8 of a power of two, so the table
+/// does not grow again on reaching it. Results past the limit are not stored.
+const MEMO_EXTENSIONS_MAX: usize = (1 << 14) / 8 * 7;
+
+thread_local! {
+    /// The memo tables of the window being stitched, kept between windows:
+    /// allocating them per window fragments the heap, which costs more memory
+    /// than the tables themselves.
+    static JUNCTION_SCAN_CACHE: std::cell::Cell<crate::align::score::JunctionScanCache> =
+        std::cell::Cell::default();
+}
+
 /// [`extend_alignment`] memoized in the window's cache. Within one window the
 /// read, genome strand and mismatch limits are fixed, so the [`ExtendKey`]
 /// fields decide the result; the recursion's leaves repeat many of them.
@@ -160,15 +173,6 @@ fn extend_alignment_cached(
     is_reverse: bool,
     extend_to_end: bool,
 ) -> ExtendResult {
-    let key = (
-        read_start,
-        genome_start,
-        direction,
-        max_extend,
-        n_mm_prev,
-        len_prev,
-        extend_to_end,
-    );
     if !jcache.memo_extensions {
         return extend_alignment(
             read_seq,
@@ -185,9 +189,18 @@ fn extend_alignment_cached(
             extend_to_end,
         );
     }
+    // Lengths are bounded by the read's, so they fit; the two flags take the low
+    // bits of the last field to keep the entry small.
+    let key = (
+        genome_start,
+        read_start as u32,
+        max_extend as u32,
+        n_mm_prev,
+        (len_prev as u32) << 2 | u32::from(direction > 0) << 1 | u32::from(extend_to_end),
+    );
     if let Some(&(extend_len, max_score, n_mismatch)) = jcache.ext.get(&key) {
         return ExtendResult {
-            extend_len,
+            extend_len: extend_len as usize,
             max_score,
             n_mismatch,
         };
@@ -206,9 +219,11 @@ fn extend_alignment_cached(
         is_reverse,
         extend_to_end,
     );
-    jcache
-        .ext
-        .insert(key, (r.extend_len, r.max_score, r.n_mismatch));
+    if jcache.ext.len() < MEMO_EXTENSIONS_MAX {
+        jcache
+            .ext
+            .insert(key, (r.extend_len as u32, r.max_score, r.n_mismatch));
+    }
     r
 }
 
@@ -3628,7 +3643,7 @@ pub(crate) fn stitch_seeds_core(
     // One memo table per window. `stitch_read`, the genome and the strand are
     // fixed for the whole recursion below, which is what makes the six-field
     // key in `JunctionScanCache` a complete identifier for a scan.
-    let mut jcache = crate::align::score::JunctionScanCache::new();
+    let mut jcache = JUNCTION_SCAN_CACHE.take();
     // Memoizing extensions pays only where the recursion has many leaves.
     jcache.memo_extensions = wa_entries.len() >= MEMO_EXTENSIONS_MIN_SEEDS;
 
@@ -3650,6 +3665,8 @@ pub(crate) fn stitch_seeds_core(
         &mut jcache,
         debug_read_name,
     );
+    jcache.clear();
+    JUNCTION_SCAN_CACHE.set(jcache);
 
     if debug {
         eprintln!(

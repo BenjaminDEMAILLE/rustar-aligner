@@ -969,26 +969,33 @@ struct JunctionScanKey {
 
 /// Per-window memo table for the junction-position scan.
 ///
-/// Create one per `stitch_seeds_core` call and pass it down the recursion; it
-/// must not outlive the read, genome and strand it was filled for; the
-/// per-window lifetime guarantees by construction.
+/// Filled by one `stitch_seeds_core` call and passed down the recursion; it
+/// must be cleared before another read, genome or strand uses it, which that
+/// function does before handing the storage to the next window.
 #[derive(Default)]
 pub struct JunctionScanCache {
     map: rustc_hash::FxHashMap<JunctionScanKey, (i32, SpliceMotif, i32, u32, u32)>,
     /// Flank extensions of the same window, for `stitch::extend_alignment_cached`.
-    pub(crate) ext: rustc_hash::FxHashMap<ExtendKey, (usize, i32, u32)>,
+    pub(crate) ext: rustc_hash::FxHashMap<ExtendKey, (u32, i32, u32)>,
     /// Whether `ext` is used for this window.
     pub(crate) memo_extensions: bool,
 }
 
 /// What a flank extension depends on within one window: where it starts, which
 /// way and how far it may go, the transcript's mismatches and length so far,
-/// and whether it must reach the read end.
-pub(crate) type ExtendKey = (usize, u64, i32, usize, u32, usize, bool);
+/// and whether it must reach the read end: genome start, read start, maximum
+/// length, mismatches, then length with the direction and end flags packed in.
+pub(crate) type ExtendKey = (u64, u32, u32, u32, u32);
 
 impl JunctionScanCache {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Forget every entry and keep the storage for the next window.
+    pub(crate) fn clear(&mut self) {
+        self.map.clear();
+        self.ext.clear();
     }
 }
 
